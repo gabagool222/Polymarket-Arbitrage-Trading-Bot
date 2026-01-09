@@ -1,0 +1,30 @@
+# Build artifacts
+target/
+Cargo.lock
+
+# Logs
+*.log
+logs/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docs
+README.md
+LICENSE
+
+# Secrets
+*.pem
+*.key
+private_key*
