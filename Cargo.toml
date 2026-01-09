@@ -1,0 +1,65 @@
+[package]
+name = "poly-rust-arb"
+version = "0.1.0"
+edition = "2021"
+authors = ["PolyRustArb Team"]
+description = "Automated hedging/arbitrage bot for Polymarket 15-min crypto markets"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full", "macros", "rt-multi-thread", "sync", "time"] }
+futures = "0.3"
+
+# HTTP & WebSocket
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Precision decimals for financial calculations
+rust_decimal = { version = "1.33", features = ["serde", "serde-with-str"] }
+rust_decimal_macros = "1.33"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Environment & Config
+dotenvy = "0.15"
+config = "0.14"
+
+# Crypto signing (for Polymarket CLOB)
+ethers = { version = "2.0", features = ["rustls", "ws"] }
+hex = "0.4"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env"] }
+
+# Async channels
+async-channel = "2.1"
+
+# UUID for order IDs
+uuid = { version = "1.6", features = ["v4"] }
+
+[features]
+default = []
+
+[[bin]]
+name = "polyarb"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
