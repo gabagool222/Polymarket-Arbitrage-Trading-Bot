@@ -33,7 +33,7 @@ dotenvy = "0.15"
 config = "0.14"
 
 # Crypto signing (for Polymarket CLOB)
-ethers = { version = "2.0", default-features = false, features = ["signers", "abigen"] }
+ethers = "2.0"
 hex = "0.4"
 
 # Time handling
