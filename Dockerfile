@@ -19,15 +19,14 @@ COPY src ./src
 
 # Build the release binary
 ENV RUST_BACKTRACE=full
-RUN cargo build --release 2>&1 | tee /tmp/build.log; \
-    BUILD_EXIT=${PIPESTATUS[0]}; \
-    if [ $BUILD_EXIT -ne 0 ]; then \
+RUN cargo build --release 2>&1 || { \
     echo ""; \
-    echo "========== BUILD FAILED - LAST 100 LINES =========="; \
-    tail -100 /tmp/build.log; \
-    echo "========== END ERROR LOG =========="; \
+    echo "========================================"; \
+    echo "BUILD FAILED - Rust compilation error:"; \
+    echo "========================================"; \
+    cargo build --release 2>&1; \
     exit 1; \
-    fi
+    }
 
 # Runtime stage
 FROM debian:bookworm-slim
