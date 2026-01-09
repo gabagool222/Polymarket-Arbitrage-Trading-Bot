@@ -285,3 +285,91 @@ pub struct HedgeTrade {
     pub timeout_at: DateTime<Utc>,
     pub pnl: Option<Decimal>,
 }
+
+// =============================================================================
+// Maker Rebates Types (Jan 2026 Program)
+// =============================================================================
+
+/// Fee rate information for a token
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeeRate {
+    pub token_id: String,
+    /// Maker fee in basis points (typically 0 for makers)
+    pub maker_fee_bps: u32,
+    /// Taker fee in basis points (funds rebate pool)
+    pub taker_fee_bps: u32,
+    /// Estimated maker rebate in basis points
+    pub maker_rebate_bps: u32,
+}
+
+impl FeeRate {
+    /// Calculate effective rebate rate at a given price
+    /// Rebate is symmetric around $0.50, lower at extremes
+    pub fn effective_rebate_at_price(&self, price: Decimal) -> Decimal {
+        // Max rebate at $0.50, decreasing towards $0 and $1
+        // Formula: rebate_rate * 4 * price * (1 - price)
+        let base_rate = Decimal::new(self.maker_rebate_bps as i64, 4);
+        let adjustment = Decimal::new(4, 0) * price * (Decimal::ONE - price);
+        base_rate * adjustment
+    }
+}
+
+/// Order fill information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fill {
+    pub id: String,
+    pub order_id: String,
+    pub market_id: String,
+    pub token_id: String,
+    pub side: Side,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub fee: Decimal,
+    /// True if this fill was from a maker (limit) order
+    pub is_maker: bool,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl Fill {
+    /// Calculate volume (price * size) in USD
+    pub fn volume(&self) -> Decimal {
+        self.price * self.size
+    }
+
+    /// Estimate rebate for this fill
+    pub fn estimated_rebate(&self, rebate_rate_bps: u32) -> Decimal {
+        if !self.is_maker {
+            return Decimal::ZERO;
+        }
+        let rate = Decimal::new(rebate_rate_bps as i64, 4);
+        self.volume() * rate
+    }
+}
+
+/// Daily rebate estimate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebateEstimate {
+    pub date: String,
+    /// Total maker volume executed today
+    pub maker_volume: Decimal,
+    /// Number of maker fills
+    pub fill_count: u32,
+    /// Estimated rebate amount (USDC)
+    pub estimated_rebate: Decimal,
+    /// Effective rebate rate in basis points
+    pub effective_rate_bps: u32,
+}
+
+impl std::fmt::Display for RebateEstimate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Rebate Est {}: ${:.4} from {} fills (${:.2} volume, {:.2}% rate)",
+            self.date,
+            self.estimated_rebate,
+            self.fill_count,
+            self.maker_volume,
+            Decimal::new(self.effective_rate_bps as i64, 2)
+        )
+    }
+}

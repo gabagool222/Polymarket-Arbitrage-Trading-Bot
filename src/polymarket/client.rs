@@ -452,4 +452,188 @@ impl PolymarketClient {
 
         Ok(orders)
     }
+
+    // =========================================================================
+    // Maker Rebates Integration (Jan 2026 Program)
+    // =========================================================================
+
+    /// Get fee rate for a token (in basis points)
+    /// Used to estimate potential rebates for maker orders
+    /// API: GET https://clob.polymarket.com/fee-rate?token_id={token_id}
+    pub async fn get_fee_rate(&self, token_id: &str) -> Result<FeeRate> {
+        let url = format!("{}/fee-rate?token_id={}", self.api_url(), token_id);
+
+        debug!("Fetching fee rate for token: {}", token_id);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch fee rate")?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            // Default to 0 fee if API fails (common for new markets)
+            warn!("Fee rate API error {}: {}. Using default.", status, body);
+            return Ok(FeeRate {
+                token_id: token_id.to_string(),
+                maker_fee_bps: 0,
+                taker_fee_bps: 0,
+                maker_rebate_bps: 100, // Default 1% rebate estimate
+            });
+        }
+
+        let fee_response: FeeRateResponse = serde_json::from_str(&body)
+            .unwrap_or_else(|_| FeeRateResponse {
+                fee_rate_bps: Some("0".to_string()),
+                maker: Some("0".to_string()),
+                taker: Some("0".to_string()),
+            });
+
+        Ok(FeeRate {
+            token_id: token_id.to_string(),
+            maker_fee_bps: fee_response
+                .maker
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(0),
+            taker_fee_bps: fee_response
+                .taker
+                .or(fee_response.fee_rate_bps)
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(0),
+            maker_rebate_bps: 100, // Estimated rebate ~1% (varies by volume share)
+        })
+    }
+
+    /// Get order fills for the current wallet
+    /// Used to track executed maker volume for rebate estimation
+    pub async fn get_fills(&self, market_id: Option<&str>) -> Result<Vec<Fill>> {
+        if self.config.is_test_mode() {
+            return Ok(Vec::new());
+        }
+
+        let wallet = self.wallet.as_ref()
+            .context("Wallet not initialized")?;
+
+        let mut url = format!(
+            "{}/fills?maker={:?}",
+            self.api_url(),
+            wallet.address()
+        );
+
+        if let Some(market) = market_id {
+            url.push_str(&format!("&market={}", market));
+        }
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch fills")?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            warn!("Fills API error {}: {}", status, body);
+            return Ok(Vec::new());
+        }
+
+        let fills: Vec<FillResponse> = serde_json::from_str(&body).unwrap_or_default();
+
+        Ok(fills
+            .into_iter()
+            .map(|f| Fill {
+                id: f.id,
+                order_id: f.order_id,
+                market_id: f.market,
+                token_id: f.asset_id,
+                side: if f.side.to_uppercase() == "BUY" {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                },
+                price: f.price.parse().unwrap_or_default(),
+                size: f.size.parse().unwrap_or_default(),
+                fee: f.fee.parse().unwrap_or_default(),
+                is_maker: f.is_maker.unwrap_or(true),
+                timestamp: chrono::DateTime::parse_from_rfc3339(&f.timestamp)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+            .collect())
+    }
+
+    /// Get today's fills for rebate estimation
+    pub async fn get_todays_fills(&self) -> Result<Vec<Fill>> {
+        let all_fills = self.get_fills(None).await?;
+        let today = chrono::Utc::now().date_naive();
+
+        Ok(all_fills
+            .into_iter()
+            .filter(|f| f.timestamp.date_naive() == today)
+            .collect())
+    }
+
+    /// Estimate daily rebates based on filled maker volume
+    /// Rebate = (your_maker_volume / total_market_maker_volume) * taker_fees_collected
+    /// Simplified: We estimate rebate_rate * your_maker_volume
+    pub async fn estimate_daily_rebates(&self) -> Result<RebateEstimate> {
+        let fills = self.get_todays_fills().await?;
+
+        let maker_fills: Vec<_> = fills.iter().filter(|f| f.is_maker).collect();
+        let maker_volume: Decimal = maker_fills
+            .iter()
+            .map(|f| f.price * f.size)
+            .sum();
+
+        let fill_count = maker_fills.len() as u32;
+
+        // Estimate rebate at ~1% of maker volume (conservative)
+        // Actual rate depends on your share of total maker volume
+        let estimated_rebate_rate = Decimal::new(100, 4); // 0.01 = 1%
+        let estimated_rebate = maker_volume * estimated_rebate_rate;
+
+        Ok(RebateEstimate {
+            date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            maker_volume,
+            fill_count,
+            estimated_rebate,
+            effective_rate_bps: 100, // 1%
+        })
+    }
+}
+
+// Fee rate response from API
+#[derive(Debug, Deserialize)]
+struct FeeRateResponse {
+    #[serde(default)]
+    fee_rate_bps: Option<String>,
+    #[serde(default)]
+    maker: Option<String>,
+    #[serde(default)]
+    taker: Option<String>,
+}
+
+// Fill response from API
+#[derive(Debug, Deserialize)]
+struct FillResponse {
+    id: String,
+    order_id: String,
+    market: String,
+    asset_id: String,
+    side: String,
+    price: String,
+    size: String,
+    #[serde(default)]
+    fee: String,
+    #[serde(default)]
+    is_maker: Option<bool>,
+    timestamp: String,
 }

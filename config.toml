@@ -111,3 +111,32 @@ json_logging = false
 
 # Log rotation: max file size in MB
 max_log_size_mb = 100
+
+[maker_rebates]
+# Enable maker rebates optimization (Jan 2026 program)
+# Earns rebates from taker fees when your limit orders are filled
+enabled = true
+
+# Minimum estimated rebate % to prioritize entry
+# If expected rebate > this threshold, increases trade priority
+rebate_estimate_threshold = 0.01
+
+# Track and log daily rebate estimates
+track_daily_rebates = true
+
+# Rebates log file
+rebates_file = "rebates.log"
+
+# Market making mode (optional, low-volatility windows)
+# Posts bid/ask around midpoint to earn rebates
+# Only activates when hedging edge is low
+enable_market_making = false
+
+# Spread for market making (basis points from midpoint)
+market_making_spread_bps = 100
+
+# Maximum position for market making (shares per side)
+market_making_max_position = 50.0
+
+# Quote refresh interval (milliseconds)
+quote_refresh_ms = 5000

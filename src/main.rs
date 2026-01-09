@@ -38,7 +38,7 @@ use crate::config::{AppConfig, OperatingMode};
 use crate::polymarket::websocket::{run_polymarket_ws, OrderBookUpdate, PriceUpdate};
 use crate::polymarket::{PolymarketClient, MarketPrices};
 use crate::trading::TradingEngine;
-use crate::utils::{init_logging, PnlTracker, SimulationEngine};
+use crate::utils::{init_logging, PnlTracker, RebateTracker, SimulationEngine};
 
 /// PolyRustArb - Polymarket Arbitrage Bot
 #[derive(Parser, Debug)]
@@ -122,9 +122,16 @@ fn print_banner(config: &AppConfig, args: &Args) {
           config.trading.min_profit_threshold);
     info!("║  Binance Integration: {}                                ║",
           if config.binance.enabled { "Enabled" } else { "Disabled" });
+    info!("║  Maker Rebates: {}                                       ║",
+          if config.maker_rebates.enabled { "Enabled" } else { "Disabled" });
     info!("║  Initial Balance: ${}                                 ║",
           args.initial_balance);
     info!("╚═══════════════════════════════════════════════════════════╝");
+
+    if config.maker_rebates.enabled {
+        info!("");
+        info!("💰 MAKER REBATES ENABLED - Earn up to 1.56% on filled limit orders");
+    }
 
     if config.is_test_mode() {
         info!("");
@@ -169,6 +176,10 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
     // Initialize PNL tracker
     let mut pnl_tracker = PnlTracker::new(Arc::clone(&config));
     let _ = pnl_tracker.load_from_file();
+
+    // Initialize rebate tracker
+    let mut rebate_tracker = RebateTracker::new(Arc::clone(&config));
+    let _ = rebate_tracker.load_from_file();
 
     info!("Fetching available 15-min crypto markets...");
 
@@ -304,8 +315,23 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
     info!("Win Rate: {:.1}%", stats.win_rate());
     info!("Net PNL: ${}", stats.net_pnl);
 
-    if let Some(sim) = sim_engine {
+    if let Some(ref sim) = sim_engine {
         sim.print_summary().await;
+
+        // Show simulated rebates
+        if config.maker_rebates.enabled {
+            let rebates = sim.get_simulated_rebates().await;
+            let volume = sim.get_simulated_maker_volume().await;
+            info!("=== SIMULATED REBATES ===");
+            info!("Maker Volume: ${:.2}", volume);
+            info!("Est. Rebates: ${:.4}", rebates);
+        }
+    }
+
+    // Show rebate tracker summary
+    if config.maker_rebates.enabled {
+        rebate_tracker.print_summary();
+        let _ = rebate_tracker.save_today();
     }
 
     let perf = pnl_tracker.get_statistics();

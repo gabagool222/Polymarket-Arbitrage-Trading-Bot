@@ -52,6 +52,9 @@ pub struct SimulationEngine {
     balance: Arc<RwLock<Decimal>>,
     pnl: Arc<RwLock<Decimal>>,
     trade_count: Arc<RwLock<u32>>,
+    /// Simulated maker rebates tracking
+    simulated_rebates: Arc<RwLock<Decimal>>,
+    simulated_maker_volume: Arc<RwLock<Decimal>>,
 }
 
 impl SimulationEngine {
@@ -64,6 +67,8 @@ impl SimulationEngine {
             balance: Arc::new(RwLock::new(initial_balance)),
             pnl: Arc::new(RwLock::new(Decimal::ZERO)),
             trade_count: Arc::new(RwLock::new(0)),
+            simulated_rebates: Arc::new(RwLock::new(Decimal::ZERO)),
+            simulated_maker_volume: Arc::new(RwLock::new(Decimal::ZERO)),
         }
     }
 
@@ -123,9 +128,16 @@ impl SimulationEngine {
                 order.filled = order.size;
                 order.status = VirtualOrderStatus::Filled;
 
+                // Calculate simulated rebate (limit orders are maker orders)
+                let volume = order.price * order.filled;
+                let rebate = self.calculate_rebate(order.price, volume);
+
+                *self.simulated_maker_volume.write().await += volume;
+                *self.simulated_rebates.write().await += rebate;
+
                 info!(
-                    "[SIM] Order filled: {} {} @ {} (market: {})",
-                    order.id, order.size, order.price, market_price
+                    "[SIM] Order filled: {} {} @ {} (market: {}) | Est rebate: ${:.4}",
+                    order.id, order.size, order.price, market_price, rebate
                 );
 
                 // Update position
@@ -136,6 +148,21 @@ impl SimulationEngine {
         }
 
         filled_orders
+    }
+
+    /// Calculate simulated rebate at a given price
+    /// Rebate rate is symmetric around $0.50, max ~1.56%
+    fn calculate_rebate(&self, price: Decimal, volume: Decimal) -> Decimal {
+        if !self.config.maker_rebates.enabled {
+            return Decimal::ZERO;
+        }
+
+        // Formula: base_rate * 4 * p * (1-p)
+        let base_rate = Decimal::new(156, 4); // 1.56%
+        let price_factor = Decimal::new(4, 0) * price * (Decimal::ONE - price);
+        let effective_rate = base_rate * price_factor;
+
+        volume * effective_rate
     }
 
     /// Update virtual position after fill
@@ -272,18 +299,41 @@ impl SimulationEngine {
             .collect()
     }
 
+    /// Get simulated maker rebates
+    pub async fn get_simulated_rebates(&self) -> Decimal {
+        *self.simulated_rebates.read().await
+    }
+
+    /// Get simulated maker volume
+    pub async fn get_simulated_maker_volume(&self) -> Decimal {
+        *self.simulated_maker_volume.read().await
+    }
+
     /// Print simulation summary
     pub async fn print_summary(&self) {
         let balance = self.get_balance().await;
         let pnl = self.get_pnl().await;
         let trades = self.get_trade_count().await;
         let positions = self.get_positions().await;
+        let rebates = self.get_simulated_rebates().await;
+        let maker_volume = self.get_simulated_maker_volume().await;
 
         info!("=== SIMULATION SUMMARY ===");
         info!("Balance: ${}", balance);
         info!("Total PNL: ${}", pnl);
         info!("Total Trades: {}", trades);
         info!("Open Positions: {}", positions.len());
+
+        // Maker rebates section
+        if self.config.maker_rebates.enabled {
+            info!("--- Maker Rebates ---");
+            info!("Maker Volume: ${:.2}", maker_volume);
+            info!("Est. Rebates: ${:.4}", rebates);
+            if maker_volume > Decimal::ZERO {
+                let effective_rate = rebates / maker_volume * Decimal::new(100, 0);
+                info!("Effective Rate: {:.3}%", effective_rate);
+            }
+        }
 
         for (token_id, pos) in positions.iter() {
             if pos.shares > Decimal::ZERO {

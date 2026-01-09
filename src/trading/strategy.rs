@@ -265,16 +265,23 @@ impl StrategyManager {
         let mut signals = Vec::new();
 
         // Check hedging opportunity
-        if let Some(signal) = self.hedging.check_opportunity(market_prices) {
+        if let Some(mut signal) = self.hedging.check_opportunity(market_prices) {
+            // Boost confidence if maker rebates are enabled
+            if self.config.maker_rebates.enabled {
+                signal = self.apply_rebate_boost(signal);
+            }
             signals.push(signal);
         }
 
         // Check latency opportunity from Binance
         if let Some(mv) = binance_move {
-            if let Some(signal) =
+            if let Some(mut signal) =
                 self.latency
                     .process_move(mv, market_prices, &market_prices.condition_id)
             {
+                if self.config.maker_rebates.enabled {
+                    signal = self.apply_rebate_boost(signal);
+                }
                 signals.push(signal);
             }
         }
@@ -287,12 +294,72 @@ impl StrategyManager {
                 market_prices.no_price
             };
 
-            if let Some(signal) = self.hedging.should_average_down(pos, current_price) {
+            if let Some(mut signal) = self.hedging.should_average_down(pos, current_price) {
+                if self.config.maker_rebates.enabled {
+                    signal = self.apply_rebate_boost(signal);
+                }
                 signals.push(signal);
             }
         }
 
         signals
+    }
+
+    /// Apply rebate-based confidence boost to a signal
+    /// Higher rebate potential = higher confidence = higher priority
+    fn apply_rebate_boost(&self, mut signal: Signal) -> Signal {
+        let rebate_estimate = self.estimate_rebate_for_signal(&signal);
+        let threshold = self.config.maker_rebates.rebate_estimate_threshold;
+
+        if rebate_estimate > threshold {
+            // Boost confidence by up to 10% based on rebate potential
+            let rebate_factor = (rebate_estimate / threshold).min(Decimal::new(2, 0));
+            let boost = Decimal::new(1, 1) * (rebate_factor - Decimal::ONE); // 0-10% boost
+
+            signal.confidence = (signal.confidence + boost).min(Decimal::ONE);
+
+            let old_reason = signal.reason.clone();
+            signal.reason = format!(
+                "{} | Rebate boost: +{:.2}% est rebate",
+                old_reason, rebate_estimate
+            );
+
+            debug!(
+                "Rebate boost applied: {} -> confidence {:.3}",
+                signal.signal_type, signal.confidence
+            );
+        }
+
+        signal
+    }
+
+    /// Estimate rebate percentage for a signal
+    fn estimate_rebate_for_signal(&self, signal: &Signal) -> Decimal {
+        let price = signal.suggested_price;
+
+        // Rebate rate is symmetric around $0.50, max ~1.56%
+        // Formula: 1.56% * 4 * p * (1-p)
+        let base_rate = Decimal::new(156, 4); // 1.56%
+        let price_factor = Decimal::new(4, 0) * price * (Decimal::ONE - price);
+
+        base_rate * price_factor * Decimal::new(100, 0) // Convert to percentage
+    }
+}
+
+/// Rebate-aware order pricing
+/// Adjusts limit order price to maximize rebate while ensuring fill
+pub fn optimize_limit_price_for_rebate(
+    base_price: Decimal,
+    side: Side,
+    spread_bps: u32,
+) -> Decimal {
+    // For maker orders, price slightly better than market to ensure we're maker
+    // But not so aggressive that we don't get filled
+    let adjustment = Decimal::new(spread_bps as i64 / 4, 4); // 25% of spread
+
+    match side {
+        Side::Buy => base_price + adjustment, // Bid higher to get filled, still maker if below ask
+        Side::Sell => base_price - adjustment, // Ask lower to get filled, still maker if above bid
     }
 }
 
