@@ -17,8 +17,9 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 
-# Build the release binary
-RUN cargo build --release
+# Build the release binary (with verbose output to see errors)
+ENV RUST_BACKTRACE=1
+RUN cargo build --release -v 2>&1 || (echo "=== BUILD FAILED ===" && cargo build --release 2>&1 && exit 1)
 
 # Runtime stage
 FROM debian:bookworm-slim

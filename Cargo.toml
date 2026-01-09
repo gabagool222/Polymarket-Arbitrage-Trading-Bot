@@ -33,7 +33,7 @@ dotenvy = "0.15"
 config = "0.14"
 
 # Crypto signing (for Polymarket CLOB)
-ethers = { version = "2.0", features = ["rustls", "ws"] }
+ethers = { version = "2.0", default-features = false, features = ["signers", "abigen"] }
 hex = "0.4"
 
 # Time handling
@@ -61,5 +61,5 @@ path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
