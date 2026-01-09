@@ -1,16 +1,20 @@
 # PolyRustArb Bot - Multi-stage Dockerfile for Coolify deployment
-# Build stage
-FROM rust:1.75-slim-bookworm AS builder
+# Build stage - using latest stable Rust for ethers compatibility
+FROM rust:1.83-slim-bookworm AS builder
 
 WORKDIR /app
 
-# Install build dependencies (including tools needed by ethers/ring crates)
+# Install ALL build dependencies needed by ethers/ring/secp256k1 crates
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     build-essential \
     cmake \
     perl \
+    git \
+    clang \
+    llvm \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests and source code
