@@ -25,30 +25,41 @@ struct ApiResponse<T> {
     error: Option<String>,
 }
 
+/// Response wrapper for CLOB API
 #[derive(Debug, Deserialize)]
-struct MarketsResponse {
-    data: Vec<MarketData>,
+struct ClobMarketsResponse {
+    data: Vec<ClobMarketData>,
     #[serde(default)]
     next_cursor: Option<String>,
 }
 
+/// Market data from CLOB API (uses snake_case)
 #[derive(Debug, Deserialize)]
-struct MarketData {
+struct ClobMarketData {
     condition_id: String,
-    question_id: String,
-    tokens: Vec<TokenData>,
-    slug: Option<String>,
+    #[serde(default)]
+    question_id: Option<String>,
+    #[serde(default)]
+    tokens: Vec<ClobTokenData>,
+    #[serde(default, alias = "slug")]
+    market_slug: Option<String>,
     question: String,
+    #[serde(default)]
     end_date_iso: Option<String>,
+    #[serde(default)]
     active: bool,
+    #[serde(default)]
     closed: bool,
+    #[serde(default)]
     accepting_orders: bool,
 }
 
+/// Token data from CLOB API
 #[derive(Debug, Deserialize)]
-struct TokenData {
+struct ClobTokenData {
     token_id: String,
     outcome: String,
+    #[serde(default)]
     price: Option<f64>,
 }
 
@@ -134,15 +145,15 @@ impl PolymarketClient {
         &self.config.general.gamma_api_url
     }
 
-    /// Fetch markets matching slug patterns
+    /// Fetch markets matching slug patterns using CLOB API
     pub async fn fetch_markets(&self, slug_pattern: &str) -> Result<Vec<Market>> {
+        // Use CLOB API which has proper market data format
         let url = format!(
-            "{}/markets?slug_filter={}&active=true&closed=false",
-            self.gamma_url(),
-            slug_pattern
+            "{}/markets?active=true&closed=false",
+            self.api_url()
         );
 
-        debug!("Fetching markets from: {}", url);
+        debug!("Fetching markets from CLOB API: {}", url);
 
         let response = self
             .http_client
@@ -158,14 +169,27 @@ impl PolymarketClient {
             anyhow::bail!("API error {}: {}", status, body);
         }
 
-        let markets_data: Vec<MarketData> = serde_json::from_str(&body)
-            .context("Failed to parse markets response")?;
+        // Debug: log first 500 chars of response
+        debug!("API response (first 500 chars): {}", &body.chars().take(500).collect::<String>());
+
+        let clob_response: ClobMarketsResponse = serde_json::from_str(&body)
+            .context("Failed to parse CLOB markets response")?;
+
+        // Filter markets by slug pattern
+        let markets_data: Vec<ClobMarketData> = clob_response.data
+            .into_iter()
+            .filter(|m| {
+                let slug = m.market_slug.as_deref().unwrap_or("").to_lowercase();
+                let question = m.question.to_lowercase();
+                slug.contains(slug_pattern) || question.contains(slug_pattern)
+            })
+            .collect();
 
         let markets: Vec<Market> = markets_data
             .into_iter()
             .map(|m| Market {
-                condition_id: m.condition_id,
-                question_id: m.question_id,
+                condition_id: m.condition_id.clone(),
+                question_id: m.question_id.unwrap_or_else(|| m.condition_id),
                 tokens: m
                     .tokens
                     .into_iter()
@@ -175,7 +199,7 @@ impl PolymarketClient {
                         price: t.price.map(|p| Decimal::try_from(p).unwrap_or_default()),
                     })
                     .collect(),
-                slug: m.slug.unwrap_or_default(),
+                slug: m.market_slug.unwrap_or_default(),
                 question: m.question,
                 end_date_iso: m.end_date_iso,
                 active: m.active,
