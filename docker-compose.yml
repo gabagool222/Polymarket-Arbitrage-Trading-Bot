@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  polyarb:
+    build: .
+    container_name: polyarb-bot
+    restart: unless-stopped
+
+    environment:
+      # Mode: test (simulation) or real (live trading)
+      - POLY_MODE=test
+
+      # Private key (required for real mode) - set in Coolify secrets!
+      # - POLY_PRIVATE_KEY=${POLY_PRIVATE_KEY}
+
+      # Trading parameters
+      - POLY_PER_TRADE_SHARES=2.0
+      - POLY_LOG_LEVEL=info
+
+      # Features
+      - POLY_BINANCE_ENABLED=true
+      - POLY_MAKER_REBATES_ENABLED=true
+
+    volumes:
+      # Persist logs
+      - ./logs:/app/logs
+      - ./pnl.log:/app/pnl.log
+      - ./rebates.log:/app/rebates.log
+      - ./trades.log:/app/trades.log
+
+    # Optional: expose for monitoring dashboard
+    # ports:
+    #   - "8080:8080"
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

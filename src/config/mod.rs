@@ -214,6 +214,53 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Maker rebates configuration (Jan 2026 program)
+/// Optimizes limit orders to earn rebates from taker fees
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MakerRebatesConfig {
+    /// Enable maker rebates optimization
+    pub enabled: bool,
+
+    /// Minimum estimated rebate % to prioritize entry
+    #[serde(with = "rust_decimal::serde::str")]
+    pub rebate_estimate_threshold: Decimal,
+
+    /// Track and log daily rebate estimates
+    pub track_daily_rebates: bool,
+
+    /// Rebates log file path
+    pub rebates_file: String,
+
+    /// Enable market making mode (optional)
+    /// Posts bid/ask around midpoint during low-volatility windows
+    pub enable_market_making: bool,
+
+    /// Spread for market making (basis points from midpoint)
+    pub market_making_spread_bps: u32,
+
+    /// Maximum position for market making (shares per side)
+    #[serde(with = "rust_decimal::serde::str")]
+    pub market_making_max_position: Decimal,
+
+    /// Quote refresh interval (milliseconds)
+    pub quote_refresh_ms: u64,
+}
+
+impl Default for MakerRebatesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rebate_estimate_threshold: Decimal::new(1, 4), // 0.01%
+            track_daily_rebates: true,
+            rebates_file: "rebates.log".to_string(),
+            enable_market_making: false,
+            market_making_spread_bps: 100,
+            market_making_max_position: Decimal::new(500, 1), // 50.0
+            quote_refresh_ms: 5000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
@@ -233,6 +280,9 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    #[serde(default)]
+    pub maker_rebates: MakerRebatesConfig,
 }
 
 impl AppConfig {
@@ -310,6 +360,16 @@ impl AppConfig {
                 self.trading.max_daily_risk_pct = parsed;
             }
         }
+
+        // Maker rebates enabled override
+        if let Ok(enabled) = std::env::var("POLY_MAKER_REBATES_ENABLED") {
+            self.maker_rebates.enabled = enabled.to_lowercase() == "true" || enabled == "1";
+        }
+
+        // Market making enabled override
+        if let Ok(enabled) = std::env::var("POLY_MARKET_MAKING_ENABLED") {
+            self.maker_rebates.enable_market_making = enabled.to_lowercase() == "true" || enabled == "1";
+        }
     }
 
     /// Validate configuration values
@@ -368,6 +428,7 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.general.mode, OperatingMode::Test);
         assert!(!config.binance.symbols.is_empty());
+        assert!(config.maker_rebates.enabled);
     }
 
     #[test]

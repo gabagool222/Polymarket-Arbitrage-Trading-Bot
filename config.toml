@@ -31,7 +31,8 @@ market_slugs = [
 ]
 
 # Shares per trade (configurable: $1 = ~2 shares at $0.50, $100 = ~200 shares)
-per_trade_shares = 2.0
+# $5 trade = 10 shares @ $0.50 price
+per_trade_shares = 10.0
 
 # Minimum value to trigger trade (if Yes_price + No_price < this)
 min_profit_threshold = 0.95
@@ -82,10 +83,12 @@ max_reconnect_attempts = 10
 
 [risk_management]
 # Maximum position size per market (in shares)
-max_position_per_market = 1000.0
+# With $318 capital, max ~60 shares per market ($30 exposure)
+max_position_per_market = 60.0
 
 # Maximum total exposure across all markets
-max_total_exposure = 5000.0
+# ~50% of capital = $159 max across all markets
+max_total_exposure = 320.0
 
 # Stop loss threshold (% of position value)
 stop_loss_pct = 10.0
@@ -111,3 +114,32 @@ json_logging = false
 
 # Log rotation: max file size in MB
 max_log_size_mb = 100
+
+[maker_rebates]
+# Enable maker rebates optimization (Jan 2026 program)
+# Earns rebates from taker fees when your limit orders are filled
+enabled = true
+
+# Minimum estimated rebate % to prioritize entry
+# If expected rebate > this threshold, increases trade priority
+rebate_estimate_threshold = 0.01
+
+# Track and log daily rebate estimates
+track_daily_rebates = true
+
+# Rebates log file
+rebates_file = "rebates.log"
+
+# Market making mode (optional, low-volatility windows)
+# Posts bid/ask around midpoint to earn rebates
+# Only activates when hedging edge is low
+enable_market_making = false
+
+# Spread for market making (basis points from midpoint)
+market_making_spread_bps = 100
+
+# Maximum position for market making (shares per side)
+market_making_max_position = 50.0
+
+# Quote refresh interval (milliseconds)
+quote_refresh_ms = 5000
