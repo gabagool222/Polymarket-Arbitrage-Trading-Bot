@@ -29,36 +29,55 @@ pub struct OrderBookUpdate {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-/// WebSocket message from Polymarket
+/// WebSocket message from Polymarket (uses event_type per docs)
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum WsIncoming {
+    BookUpdate {
+        event_type: String,
+        asset_id: String,
+        #[serde(default)]
+        market: Option<String>,
+        bids: Vec<WsBookLevel>,
+        asks: Vec<WsBookLevel>,
+        #[serde(default)]
+        timestamp: Option<String>,
+        #[serde(default)]
+        hash: Option<String>,
+    },
     PriceChange {
+        event_type: String,
+        #[serde(default)]
+        market: Option<String>,
+        #[serde(default)]
+        price_changes: Vec<PriceChangeItem>,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
+    // Legacy format fallback
+    LegacyPriceChange {
         #[serde(rename = "type")]
         msg_type: String,
         asset_id: String,
         price: String,
+        #[serde(default)]
         timestamp: Option<String>,
-    },
-    BookUpdate {
-        #[serde(rename = "type")]
-        msg_type: String,
-        asset_id: String,
-        market: Option<String>,
-        bids: Vec<WsBookLevel>,
-        asks: Vec<WsBookLevel>,
-        timestamp: Option<String>,
-        hash: Option<String>,
-    },
-    Subscribed {
-        #[serde(rename = "type")]
-        msg_type: String,
-        channel: Option<String>,
-    },
-    Error {
-        error: String,
     },
     Other(serde_json::Value),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PriceChangeItem {
+    asset_id: String,
+    price: String,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    best_bid: Option<String>,
+    #[serde(default)]
+    best_ask: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,12 +86,11 @@ struct WsBookLevel {
     size: String,
 }
 
-/// Subscription message
+/// Subscription message for market channel
 #[derive(Debug, Serialize)]
 struct SubscribeMessage {
     #[serde(rename = "type")]
     msg_type: String,
-    channel: String,
     assets_ids: Vec<String>,
 }
 
@@ -129,29 +147,19 @@ impl PolymarketWs {
             .await
             .context("Failed to connect to Polymarket WebSocket")?;
 
-        let (mut write, mut read) = ws_stream.split();
+        let (mut write, read) = ws_stream.split();
 
-        // Subscribe to price channel
-        let price_sub = SubscribeMessage {
-            msg_type: "subscribe".to_string(),
-            channel: "price".to_string(),
+        // Subscribe to market channel with asset IDs (per official docs)
+        // Format: {"type": "market", "assets_ids": [...]}
+        let sub_msg = SubscribeMessage {
+            msg_type: "market".to_string(),
             assets_ids: token_ids.clone(),
         };
 
-        let msg = serde_json::to_string(&price_sub)?;
+        let msg = serde_json::to_string(&sub_msg)?;
+        debug!("Sending subscription: {}", msg);
         write.send(Message::Text(msg)).await?;
-        debug!("Subscribed to price channel for {} tokens", token_ids.len());
-
-        // Subscribe to book channel
-        let book_sub = SubscribeMessage {
-            msg_type: "subscribe".to_string(),
-            channel: "book".to_string(),
-            assets_ids: token_ids.clone(),
-        };
-
-        let msg = serde_json::to_string(&book_sub)?;
-        write.send(Message::Text(msg)).await?;
-        debug!("Subscribed to book channel for {} tokens", token_ids.len());
+        info!("Subscribed to market channel for {} tokens", token_ids.len());
 
         // Clone Arc references for the read loop
         let prices = Arc::clone(&self.prices);
@@ -159,8 +167,27 @@ impl PolymarketWs {
         let price_tx = self.price_tx.clone();
         let book_tx = self.book_tx.clone();
 
-        // Spawn read loop
+        // Spawn PING keepalive and read loop
         tokio::spawn(async move {
+            // Wrap write for the ping task
+            let write = Arc::new(tokio::sync::Mutex::new(write));
+            let write_clone = Arc::clone(&write);
+            
+            // Spawn ping keepalive
+            let ping_handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    let mut w = write_clone.lock().await;
+                    if w.send(Message::Text("PING".to_string())).await.is_err() {
+                        debug!("Failed to send PING, connection may be closed");
+                        break;
+                    }
+                    debug!("Sent PING keepalive");
+                }
+            });
+            
+            // Read loop
+            let mut read = read;
             while let Some(msg_result) = read.next().await {
                 match msg_result {
                     Ok(Message::Text(text)) => {
@@ -177,9 +204,12 @@ impl PolymarketWs {
                         }
                     }
                     Ok(Message::Ping(data)) => {
-                        debug!("Received ping");
-                        // Pong is handled automatically by tungstenite
-                        let _ = data;
+                        debug!("Received ping, sending pong");
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Pong(data)).await;
+                    }
+                    Ok(Message::Pong(_)) => {
+                        debug!("Received pong");
                     }
                     Ok(Message::Close(frame)) => {
                         info!("WebSocket closed: {:?}", frame);
@@ -192,6 +222,9 @@ impl PolymarketWs {
                     _ => {}
                 }
             }
+            
+            // Cancel ping task when read loop ends
+            ping_handle.abort();
             warn!("Polymarket WebSocket read loop ended");
         });
 
@@ -220,31 +253,8 @@ impl PolymarketWs {
         };
 
         match msg {
-            WsIncoming::PriceChange {
-                msg_type,
-                asset_id,
-                price,
-                timestamp: _,
-            } => {
-                if msg_type == "price_change" || msg_type == "last_trade_price" {
-                    let price_dec: Decimal = price.parse().unwrap_or_default();
-
-                    // Update price cache
-                    prices.write().await.insert(asset_id.clone(), price_dec);
-
-                    // Broadcast update
-                    let update = PriceUpdate {
-                        token_id: asset_id,
-                        price: price_dec,
-                        timestamp: chrono::Utc::now(),
-                    };
-
-                    let _ = price_tx.send(update);
-                }
-            }
-
             WsIncoming::BookUpdate {
-                msg_type,
+                event_type,
                 asset_id,
                 market: _,
                 bids,
@@ -252,7 +262,7 @@ impl PolymarketWs {
                 timestamp: _,
                 hash: _,
             } => {
-                if msg_type == "book" {
+                if event_type == "book" {
                     let book = OrderBook {
                         token_id: asset_id.clone(),
                         bids: bids
@@ -287,16 +297,55 @@ impl PolymarketWs {
                 }
             }
 
-            WsIncoming::Subscribed { msg_type, channel } => {
-                debug!("Subscription confirmed: {} {:?}", msg_type, channel);
+            WsIncoming::PriceChange {
+                event_type,
+                market: _,
+                price_changes,
+                timestamp: _,
+            } => {
+                if event_type == "price_change" {
+                    for change in price_changes {
+                        let price_dec: Decimal = change.price.parse().unwrap_or_default();
+
+                        // Update price cache
+                        prices.write().await.insert(change.asset_id.clone(), price_dec);
+
+                        // Broadcast update
+                        let update = PriceUpdate {
+                            token_id: change.asset_id,
+                            price: price_dec,
+                            timestamp: chrono::Utc::now(),
+                        };
+
+                        let _ = price_tx.send(update);
+                    }
+                }
             }
 
-            WsIncoming::Error { error } => {
-                error!("WebSocket error message: {}", error);
+            // Handle legacy format for backwards compatibility
+            WsIncoming::LegacyPriceChange {
+                msg_type,
+                asset_id,
+                price,
+                timestamp: _,
+            } => {
+                if msg_type == "price_change" || msg_type == "last_trade_price" {
+                    let price_dec: Decimal = price.parse().unwrap_or_default();
+
+                    prices.write().await.insert(asset_id.clone(), price_dec);
+
+                    let update = PriceUpdate {
+                        token_id: asset_id,
+                        price: price_dec,
+                        timestamp: chrono::Utc::now(),
+                    };
+
+                    let _ = price_tx.send(update);
+                }
             }
 
             WsIncoming::Other(val) => {
-                debug!("Unknown message: {:?}", val);
+                debug!("Unknown/unhandled message: {:?}", val);
             }
         }
 
