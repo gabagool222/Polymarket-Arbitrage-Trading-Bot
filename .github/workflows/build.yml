@@ -22,10 +22,7 @@ jobs:
           sudo apt-get install -y pkg-config libssl-dev build-essential cmake perl
 
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
-        with:
-          toolchain: stable
-          components: clippy
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Show Rust version
         run: rustc --version && cargo --version
