@@ -4,10 +4,13 @@ FROM rust:1.75-slim-bookworm AS builder
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies (including tools needed by ethers/ring crates)
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    build-essential \
+    cmake \
+    perl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests and source code
