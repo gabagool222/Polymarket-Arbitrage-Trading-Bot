@@ -207,8 +207,17 @@ impl PolymarketWs {
         price_tx: &broadcast::Sender<PriceUpdate>,
         book_tx: &broadcast::Sender<OrderBookUpdate>,
     ) -> Result<()> {
-        let msg: WsIncoming = serde_json::from_str(text)
-            .context("Failed to parse WebSocket message")?;
+        // Try to parse as known message type
+        let msg: WsIncoming = match serde_json::from_str(text) {
+            Ok(m) => m,
+            Err(e) => {
+                // Log the first 200 chars of the failed message for debugging
+                let preview = text.chars().take(200).collect::<String>();
+                debug!("Failed to parse WS message: {} | Preview: {}", e, preview);
+                // Return Ok to not treat as error - just ignore unknown messages
+                return Ok(());
+            }
+        };
 
         match msg {
             WsIncoming::PriceChange {
