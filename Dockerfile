@@ -21,16 +21,12 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 
+# Debug: Show what files we have
+RUN echo "=== Files in /app ===" && ls -la && echo "=== Cargo.toml ===" && head -20 Cargo.toml && echo "=== src/ ===" && ls -la src/
+
 # Build the release binary
 ENV RUST_BACKTRACE=full
-RUN cargo build --release 2>&1 || { \
-    echo ""; \
-    echo "========================================"; \
-    echo "BUILD FAILED - Rust compilation error:"; \
-    echo "========================================"; \
-    cargo build --release 2>&1; \
-    exit 1; \
-    }
+RUN cargo check --release 2>&1 && cargo build --release
 
 # Runtime stage
 FROM debian:bookworm-slim
