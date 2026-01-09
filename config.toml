@@ -75,7 +75,7 @@ symbols = ["btcusdt", "ethusdt", "solusdt"]
 move_window_sec = 5
 
 # Binance WebSocket URL (public, no API key needed)
-ws_url = "wss://stream.binance.com:9443/ws"
+ws_url = "wss://stream.binance.com:9443"
 
 # Reconnect settings
 reconnect_delay_ms = 1000
