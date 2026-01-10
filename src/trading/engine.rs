@@ -5,7 +5,10 @@ use crate::config::AppConfig;
 use crate::polymarket::types::{Market, MarketPrices, OrderRequest, OrderType, Side, TokenType};
 use crate::polymarket::PolymarketClient;
 use crate::trading::strategy::StrategyManager;
-use crate::trading::types::*;
+use crate::trading::types::{
+    DailyStats, HedgeStatus, HedgeTrade, LegStatus, OrderStatus, PlacedOrder,
+    Position, RiskState, Signal, SignalType, TradeLeg,
+};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use rust_decimal::Decimal;
@@ -67,6 +70,291 @@ impl TradingEngine {
     /// Get cached market by condition_id
     pub async fn get_cached_market(&self, condition_id: &str) -> Option<Market> {
         self.cached_markets.read().await.get(condition_id).cloned()
+    }
+
+    // =========================================================================
+    // LIMIT ORDER PLACEMENT (matches Polymarket Web UI)
+    // =========================================================================
+
+    /// Place a limit buy order with proper validation
+    /// Matches web UI: Limit Price, Shares, GTC, cost calculation
+    pub async fn place_limit_buy(
+        &self,
+        token_id: &str,
+        price: Decimal,
+        size: Decimal,
+        market_id: &str,
+        token_type: TokenType,
+    ) -> Result<PlacedOrder> {
+        let is_simulated = self.config.is_test_mode();
+
+        // 1. Fetch market metadata for validation
+        let (min_size, tick_size) = self.client.get_market_metadata(token_id).await
+            .unwrap_or((Decimal::new(5, 0), Decimal::new(1, 2))); // Default: min 5 shares, tick 0.01
+
+        // 2. Validate and adjust size
+        let adjusted_size = if size < min_size {
+            warn!(
+                "Size {} below min {}. Adjusting to min.",
+                size, min_size
+            );
+            min_size
+        } else {
+            size
+        };
+
+        // 3. Validate and adjust price to tick size
+        let tick_digits = Self::get_tick_digits(tick_size);
+        let adjusted_price = price.round_dp(tick_digits);
+
+        if adjusted_price != price {
+            debug!(
+                "Price {} adjusted to {} (tick: {})",
+                price, adjusted_price, tick_size
+            );
+        }
+
+        // 4. Validate price range (0.01 to 0.99 for binary markets)
+        if adjusted_price < Decimal::new(1, 2) || adjusted_price > Decimal::new(99, 2) {
+            anyhow::bail!(
+                "Price {} outside valid range [0.01, 0.99]",
+                adjusted_price
+            );
+        }
+
+        // 5. Calculate cost and potential win
+        let cost = adjusted_price * adjusted_size;
+        let potential_win = adjusted_size; // $1 per share if win
+        let profit_if_win = potential_win - cost;
+        let rebate_estimate = self.estimate_maker_rebate(adjusted_price, adjusted_size);
+
+        // 6. Simulation mode - detailed logging like web UI
+        if is_simulated {
+            info!("╔══════════════════════════════════════════════════════════════╗");
+            info!("║  [SIMULATION] LIMIT BUY ORDER                                ║");
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║  Token:     {} ({})                    ", token_type, &token_id[0..8.min(token_id.len())]);
+            info!("║  Market:    {}                         ", market_id);
+            info!("║  ─────────────────────────────────────────────────────────── ║");
+            info!("║  Limit Price:  ${:.2} ({:.0}¢)                              ", adjusted_price, adjusted_price * Decimal::new(100, 0));
+            info!("║  Shares:       {}                                           ", adjusted_size);
+            info!("║  Order Type:   GTC (Good Til Cancelled)                      ║");
+            info!("║  ─────────────────────────────────────────────────────────── ║");
+            info!("║  Cost:         ${:.2}                                       ", cost);
+            info!("║  To Win:       ${:.2} (per share = $1)                      ", potential_win);
+            info!("║  Profit if Win: ${:.2}                                      ", profit_if_win);
+            info!("║  Est. Rebate:  ${:.4} (maker)                               ", rebate_estimate);
+            info!("╚══════════════════════════════════════════════════════════════╝");
+
+            // Return simulated order
+            return Ok(PlacedOrder {
+                id: format!("sim_{}", uuid::Uuid::new_v4()),
+                token_id: token_id.to_string(),
+                side: Side::Buy,
+                price: adjusted_price,
+                size: adjusted_size,
+                filled_size: Decimal::ZERO,
+                status: OrderStatus::Open,
+                is_simulated: true,
+            });
+        }
+
+        // 7. Real mode - place actual order
+        let order_request = OrderRequest {
+            token_id: token_id.to_string(),
+            side: Side::Buy,
+            price: adjusted_price,
+            size: adjusted_size,
+            order_type: OrderType::GoodTilCancelled,
+            expiration: None, // GTC = no expiration
+        };
+
+        let placed = self.client.place_order(&order_request).await?;
+
+        info!(
+            "✅ LIMIT BUY placed: {} {} @ ${:.2} | Cost: ${:.2} | Order ID: {}",
+            token_type, adjusted_size, adjusted_price, cost, placed.id
+        );
+
+        Ok(PlacedOrder {
+            id: placed.id,
+            token_id: token_id.to_string(),
+            side: Side::Buy,
+            price: adjusted_price,
+            size: adjusted_size,
+            filled_size: Decimal::ZERO,
+            status: OrderStatus::Open,
+            is_simulated: false,
+        })
+    }
+
+    /// Execute full hedge batch: Buy both sides (Yes + No) to lock profit
+    /// Leg1: Buy cheaper side first, Leg2: Buy opposite side
+    pub async fn execute_hedge_batch(
+        &self,
+        market_id: &str,
+        yes_token_id: &str,
+        no_token_id: &str,
+        yes_price: Decimal,
+        no_price: Decimal,
+    ) -> Result<HedgeTrade> {
+        let is_simulated = self.config.is_test_mode();
+        let size = self.config.trading.per_trade_shares;
+
+        // Determine which side is cheaper (buy cheaper first for better fill odds)
+        let (leg1_token, leg1_price, leg1_type, leg2_token, leg2_price, leg2_type) =
+            if yes_price <= no_price {
+                (yes_token_id, yes_price, TokenType::Yes, no_token_id, no_price, TokenType::No)
+            } else {
+                (no_token_id, no_price, TokenType::No, yes_token_id, yes_price, TokenType::Yes)
+            };
+
+        let total_cost = leg1_price + leg2_price;
+        let edge = Decimal::ONE - total_cost;
+        let profit_per_share = edge;
+        let total_profit = profit_per_share * size;
+
+        info!("═══════════════════════════════════════════════════════════════");
+        info!("  HEDGE ARBITRAGE EXECUTION");
+        info!("═══════════════════════════════════════════════════════════════");
+        info!("  Market: {}", market_id);
+        info!("  Yes: ${:.2} | No: ${:.2} | Sum: ${:.4}", yes_price, no_price, total_cost);
+        info!("  Edge: ${:.4} per share ({:.2}%)", edge, edge * Decimal::new(100, 0));
+        info!("  Size: {} shares per leg", size);
+        info!("  Expected Profit: ${:.4}", total_profit);
+        info!("───────────────────────────────────────────────────────────────");
+
+        // Place Leg 1 (cheaper side)
+        info!("  [Leg 1] Placing {} buy @ ${:.2}...", leg1_type, leg1_price);
+        let leg1_order = self.place_limit_buy(
+            leg1_token,
+            leg1_price,
+            size,
+            market_id,
+            leg1_type,
+        ).await?;
+
+        // For simulation, immediately place Leg 2
+        // For real mode, we wait for Leg 1 fill in check_active_trades
+        if is_simulated {
+            info!("  [Leg 2] Placing {} buy @ ${:.2}...", leg2_type, leg2_price);
+            let leg2_order = self.place_limit_buy(
+                leg2_token,
+                leg2_price,
+                size,
+                market_id,
+                leg2_type,
+            ).await?;
+
+            // Create completed hedge trade for simulation
+            let trade_id = uuid::Uuid::new_v4().to_string();
+            let trade = HedgeTrade {
+                id: trade_id.clone(),
+                market_id: market_id.to_string(),
+                asset: self.extract_asset(market_id),
+                leg1: TradeLeg {
+                    order_id: Some(leg1_order.id),
+                    token_id: leg1_token.to_string(),
+                    token_type: leg1_type,
+                    side: Side::Buy,
+                    price: leg1_price,
+                    size,
+                    filled_size: size, // Simulated as filled
+                    status: LegStatus::Filled,
+                    filled_at: Some(Utc::now()),
+                },
+                leg2: Some(TradeLeg {
+                    order_id: Some(leg2_order.id),
+                    token_id: leg2_token.to_string(),
+                    token_type: leg2_type,
+                    side: Side::Buy,
+                    price: leg2_price,
+                    size,
+                    filled_size: size, // Simulated as filled
+                    status: LegStatus::Filled,
+                    filled_at: Some(Utc::now()),
+                }),
+                status: HedgeStatus::Complete,
+                entry_reason: format!("Hedge arb: sum={:.4}, edge={:.4}", total_cost, edge),
+                created_at: Utc::now(),
+                timeout_at: Utc::now() + Duration::seconds(self.config.trading.max_legs_timeout_sec as i64),
+                closed_at: Some(Utc::now()),
+                pnl: Some(total_profit),
+                is_simulated: true,
+            };
+
+            info!("═══════════════════════════════════════════════════════════════");
+            info!("  ✅ [SIMULATION] HEDGE COMPLETE!");
+            info!("  Total Cost: ${:.4}", total_cost * size);
+            info!("  Guaranteed Payout: ${:.2}", size);
+            info!("  Locked Profit: ${:.4}", total_profit);
+            info!("═══════════════════════════════════════════════════════════════");
+
+            // Store trade
+            self.active_trades.write().await.insert(trade_id.clone(), trade.clone());
+
+            return Ok(trade);
+        }
+
+        // Real mode: Create pending trade, wait for Leg1 fill
+        let trade_id = uuid::Uuid::new_v4().to_string();
+        let trade = HedgeTrade {
+            id: trade_id.clone(),
+            market_id: market_id.to_string(),
+            asset: self.extract_asset(market_id),
+            leg1: TradeLeg {
+                order_id: Some(leg1_order.id),
+                token_id: leg1_token.to_string(),
+                token_type: leg1_type,
+                side: Side::Buy,
+                price: leg1_price,
+                size,
+                filled_size: Decimal::ZERO,
+                status: LegStatus::Open,
+                filled_at: None,
+            },
+            leg2: None, // Will be placed after Leg1 fills
+            status: HedgeStatus::Leg1Pending,
+            entry_reason: format!("Hedge arb: sum={:.4}, edge={:.4}", total_cost, edge),
+            created_at: Utc::now(),
+            timeout_at: Utc::now() + Duration::seconds(self.config.trading.max_legs_timeout_sec as i64),
+            closed_at: None,
+            pnl: None,
+            is_simulated: false,
+        };
+
+        // Store pending trade
+        self.active_trades.write().await.insert(trade_id.clone(), trade.clone());
+
+        info!("  Hedge trade {} created. Waiting for Leg1 fill...", trade_id);
+
+        Ok(trade)
+    }
+
+    /// Get number of decimal places for tick size
+    fn get_tick_digits(tick_size: Decimal) -> u32 {
+        // tick_size 0.01 = 2 digits, 0.001 = 3 digits, etc.
+        let s = tick_size.to_string();
+        if let Some(pos) = s.find('.') {
+            (s.len() - pos - 1) as u32
+        } else {
+            0
+        }
+    }
+
+    /// Estimate maker rebate for an order
+    /// Formula: 1.56% * 4 * price * (1 - price) (max at price = 0.50)
+    fn estimate_maker_rebate(&self, price: Decimal, size: Decimal) -> Decimal {
+        if !self.config.maker_rebates.enabled {
+            return Decimal::ZERO;
+        }
+
+        let rebate_rate = Decimal::new(156, 4); // 1.56%
+        let variance_factor = Decimal::new(4, 0) * price * (Decimal::ONE - price);
+        let effective_rate = rebate_rate * variance_factor;
+        let volume = price * size;
+
+        volume * effective_rate
     }
 
     /// Process market price update
