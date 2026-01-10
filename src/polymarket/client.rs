@@ -351,15 +351,15 @@ impl PolymarketClient {
 
     /// Fetch active 15-minute crypto binary markets with proper yes/no token mapping
     /// Uses pagination and specific filters to find "updown" markets
+    /// Retries failed requests up to 3 times
     pub async fn fetch_active_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
         let mut crypto_markets = Vec::new();
         let limit = 100;
         let mut offset = 0;
         
-        // We focus on "updown" slug as generic filter, then refine in loop
-        // If this yields too few results, we might need multiple passes (title_contains, etc)
+        // Base URL with sorting (newest first by ID) as requested
         let base_url = format!(
-            "{}/markets?active=true&closed=false&limit={}&ascending=false&slug_contains=updown",
+            "{}/markets?active=true&closed=false&limit={}&order=id&ascending=false&slug_contains=updown",
             self.gamma_url(),
             limit
         );
@@ -368,18 +368,27 @@ impl PolymarketClient {
             let url = format!("{}&offset={}", base_url, offset);
             debug!("Fetching markets page: offset={}", offset);
 
-            let response = self
-                .http_client
-                .get(&url)
-                .send()
-                .await
-                .context("Failed to fetch markets page")?;
+            // Retry logic (3 attempts)
+            let mut attempts = 0;
+            let response = loop {
+                attempts += 1;
+                match self.http_client.get(&url).send().await {
+                    Ok(resp) => break Ok(resp),
+                    Err(e) => {
+                        if attempts >= 3 {
+                            break Err(e);
+                        }
+                        warn!("Failed to fetch markets (attempt {}/3): {}. Retrying...", attempts, e);
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }.context("Failed to fetch markets page after 3 attempts")?;
 
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
                 warn!("Gamma API error {}: {}", status, body);
-                break; // Stop on error
+                break; // Stop on API error
             }
 
             let markets_json: Vec<serde_json::Value> = response.json().await
@@ -425,6 +434,7 @@ impl PolymarketClient {
                 let slug_lower = slug.to_lowercase();
 
                 // Strict filter for 15-min / up-down markets
+                // Either strict slug match OR backup title match
                 let is_target_format = slug_lower.contains("updown") 
                     || slug_lower.contains("up-down")
                     || (title_lower.contains("up or down") && (title_lower.contains("15m") || title_lower.contains("15 min")));
@@ -463,6 +473,8 @@ impl PolymarketClient {
                     (token_ids[0].clone(), token_ids[1].clone())
                 };
 
+                debug!("Discovered: {} ({}) [Yes: {}...]", slug, asset, &yes_token_id[0..6]);
+
                 crypto_markets.push(CryptoMarket {
                     slug: slug.to_string(),
                     title: title.to_string(),
@@ -480,9 +492,8 @@ impl PolymarketClient {
                 break; // Less than limit means last page
             }
             
-            // Safety break to prevent infinite loops
-            if offset > 1000 {
-                warn!("Reached pagination safety limit (1000 markets)");
+            // Safety break 
+            if offset > 2000 {
                 break;
             }
         }
@@ -490,7 +501,7 @@ impl PolymarketClient {
         // Log findings
         info!("=== DISCOVERED 15-MIN CRYPTO MARKETS ===");
         if crypto_markets.is_empty() {
-             warn!("No markets found with query: slug_contains=updown. Check API or market availability.");
+             warn!("No markets found. Check API connectivity or filters.");
         } else {
             for (i, cm) in crypto_markets.iter().enumerate() {
                 info!(
