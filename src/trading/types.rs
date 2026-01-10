@@ -125,6 +125,68 @@ impl std::fmt::Display for HedgeStatus {
     }
 }
 
+/// Order status for placed orders
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderStatus {
+    /// Order is live on the orderbook
+    Open,
+    /// Order is partially filled
+    PartiallyFilled,
+    /// Order is completely filled
+    Filled,
+    /// Order was cancelled
+    Cancelled,
+    /// Order failed/rejected
+    Failed,
+}
+
+impl std::fmt::Display for OrderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrderStatus::Open => write!(f, "OPEN"),
+            OrderStatus::PartiallyFilled => write!(f, "PARTIAL"),
+            OrderStatus::Filled => write!(f, "FILLED"),
+            OrderStatus::Cancelled => write!(f, "CANCELLED"),
+            OrderStatus::Failed => write!(f, "FAILED"),
+        }
+    }
+}
+
+/// Placed order result (from place_limit_buy)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacedOrder {
+    pub id: String,
+    pub token_id: String,
+    pub side: Side,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub filled_size: Decimal,
+    pub status: OrderStatus,
+    pub is_simulated: bool,
+}
+
+impl PlacedOrder {
+    /// Calculate cost of order
+    pub fn cost(&self) -> Decimal {
+        self.price * self.size
+    }
+
+    /// Calculate potential win (if outcome is correct)
+    pub fn potential_win(&self) -> Decimal {
+        self.size // $1 per share
+    }
+
+    /// Calculate profit if win
+    pub fn profit_if_win(&self) -> Decimal {
+        self.potential_win() - self.cost()
+    }
+
+    /// Check if order is fully filled
+    pub fn is_filled(&self) -> bool {
+        self.filled_size >= self.size
+    }
+}
+
 /// Position tracking per market
 #[derive(Debug, Clone, Default)]
 pub struct Position {
