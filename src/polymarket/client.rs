@@ -123,6 +123,11 @@ struct CreateOrderRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct CreateOrdersRequest {
+    orders: Vec<SignedOrder>,
+}
+
+#[derive(Debug, Serialize)]
 struct SignedOrder {
     salt: String,
     maker: String,
@@ -643,6 +648,50 @@ impl PolymarketClient {
         Ok((yes_token, no_token))
     }
 
+    /// Place multiple orders in a batch (atomic-like)
+    pub async fn place_orders(&self, orders: Vec<OrderRequest>) -> Result<Vec<Order>> {
+        if self.config.is_test_mode() {
+            let mut simulated = Vec::new();
+            for order in orders {
+                simulated.push(self.simulate_order(&order)?);
+            }
+            return Ok(simulated);
+        }
+
+        let wallet = self.wallet.as_ref()
+            .context("Wallet not initialized for real trading")?;
+
+        let mut signed_orders = Vec::new();
+        for order in &orders {
+            signed_orders.push(self.build_signed_order(order, wallet).await?);
+        }
+
+        // Batch endpoint is typically /orders
+        let url = format!("{}/orders", self.api_url());
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&CreateOrdersRequest { orders: signed_orders })
+            .send()
+            .await
+            .context("Failed to place batch orders")?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!("Batch order failed {}: {}", status, body);
+        }
+
+        // Parse list of orders
+        let orders_response: Vec<Order> = serde_json::from_str(&body)
+            .context("Failed to parse batch order response")?;
+
+        info!("Batch orders placed successfully: {} orders", orders_response.len());
+        Ok(orders_response)
+    }
+
     /// Place a limit order (real mode only)
     pub async fn place_order(&self, order: &OrderRequest) -> Result<Order> {
         if self.config.is_test_mode() {
@@ -702,50 +751,120 @@ impl PolymarketClient {
         })
     }
 
-    /// Build a signed order
+    /// Build a signed order using EIP-712
     async fn build_signed_order(
         &self,
         order: &OrderRequest,
         wallet: &LocalWallet,
     ) -> Result<SignedOrder> {
-        let maker = format!("{:?}", wallet.address());
-        let salt = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-        let nonce = "0".to_string();
-        let expiration = order
-            .expiration
-            .unwrap_or_else(|| chrono::Utc::now().timestamp() + 3600)
-            .to_string();
+        let chain_id = 137;
+        // Polymarket CTF Exchange
+        let verifying_contract: Address = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".parse()?;
 
-        // Calculate amounts based on price and size
-        let price_decimal = order.price;
-        let size_decimal = order.size;
-        let maker_amount = (size_decimal * Decimal::new(1_000_000, 0)).to_string();
-        let taker_amount = (size_decimal * price_decimal * Decimal::new(1_000_000, 0)).to_string();
+        let salt = U256::from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+        let maker = wallet.address();
+        let signer = wallet.address(); // Same as maker for EOA
+        let taker = Address::zero();
+        
+        // Parse token_id (decimal string)
+        let token_id = U256::from_dec_str(&order.token_id)
+            .context("Invalid token_id format")?;
+            
+        let expiration = order.expiration
+            .unwrap_or_else(|| chrono::Utc::now().timestamp() + 300); // 5 mins default
+        let expiration_u256 = U256::from(expiration);
+        
+        let nonce = U256::zero();
+        let fee_rate_bps = U256::zero();
+        let side_int = match order.side {
+            Side::Buy => U256::zero(),
+            Side::Sell => U256::one(),
+        };
+        let signature_type = U256::zero();
 
-        // Create message hash for signing
-        let message = format!(
-            "{}{}{}{}{}{}{}",
-            salt, maker, order.token_id, maker_amount, taker_amount, expiration, nonce
+        // Calculate amounts (USDC & Token both 6 decimals)
+        let size_raw = (order.size * Decimal::new(1_000_000, 0)).to_string();
+        let size_u256 = U256::from_dec_str(&size_raw).unwrap_or(U256::zero());
+        
+        let cost_raw = (order.size * order.price * Decimal::new(1_000_000, 0)).round().to_string();
+        let cost_u256 = U256::from_dec_str(&cost_raw).unwrap_or(U256::zero());
+
+        // Maker/Taker amounts rule:
+        // Buy: Maker=USDC (Cost), Taker=Tokens (Size)
+        // Sell: Maker=Tokens (Size), Taker=USDC (Cost)
+        let (maker_amount, taker_amount) = match order.side {
+            Side::Buy => (cost_u256, size_u256),
+            Side::Sell => (size_u256, cost_u256),
+        };
+
+        // Construct TypedData
+        let domain = ethers::types::transaction::eip712::Eip712Domain {
+            name: Some("Polymarket CTF Exchange".to_string()),
+            version: Some("1".to_string()),
+            chain_id: Some(U256::from(chain_id)),
+            verifying_contract: Some(verifying_contract),
+            salt: None,
+        };
+
+        let mut types = std::collections::BTreeMap::new();
+        types.insert(
+            "Order".to_string(),
+            vec![
+                ethers::types::transaction::eip712::Eip712DomainType { name: "salt".to_string(), type_: "uint256".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "maker".to_string(), type_: "address".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "signer".to_string(), type_: "address".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "taker".to_string(), type_: "address".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "tokenId".to_string(), type_: "uint256".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "makerAmount".to_string(), type_: "uint256".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "takerAmount".to_string(), type_: "uint256".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "expiration".to_string(), type_: "uint256".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "nonce".to_string(), type_: "uint256".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "feeRateBps".to_string(), type_: "uint256".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "side".to_string(), type_: "uint256".to_string() },
+                ethers::types::transaction::eip712::Eip712DomainType { name: "signatureType".to_string(), type_: "uint256".to_string() },
+            ],
         );
 
+        let mut message = std::collections::BTreeMap::new();
+        message.insert("salt".to_string(), serde_json::json!(salt.to_string()));
+        message.insert("maker".to_string(), serde_json::json!(format!("{:?}", maker)));
+        message.insert("signer".to_string(), serde_json::json!(format!("{:?}", signer)));
+        message.insert("taker".to_string(), serde_json::json!(format!("{:?}", taker)));
+        message.insert("tokenId".to_string(), serde_json::json!(token_id.to_string()));
+        message.insert("makerAmount".to_string(), serde_json::json!(maker_amount.to_string()));
+        message.insert("takerAmount".to_string(), serde_json::json!(taker_amount.to_string()));
+        message.insert("expiration".to_string(), serde_json::json!(expiration_u256.to_string()));
+        message.insert("nonce".to_string(), serde_json::json!(nonce.to_string()));
+        message.insert("feeRateBps".to_string(), serde_json::json!(fee_rate_bps.to_string()));
+        message.insert("side".to_string(), serde_json::json!(side_int.to_string()));
+        message.insert("signatureType".to_string(), serde_json::json!(signature_type.to_string()));
+
+        let typed_data = ethers::types::transaction::eip712::TypedData {
+            domain,
+            types,
+            primary_type: "Order".to_string(),
+            message,
+        };
+
+        // Sign Typed Data
         let signature = wallet
-            .sign_message(message.as_bytes())
+            .sign_typed_data(&typed_data)
             .await
-            .context("Failed to sign order")?;
+            .context("Failed to sign EIP-712 order")?;
 
         Ok(SignedOrder {
-            salt,
-            maker: maker.clone(),
-            signer: maker,
-            taker: "0x0000000000000000000000000000000000000000".to_string(),
-            token_id: order.token_id.clone(),
-            maker_amount,
-            taker_amount,
-            expiration,
-            nonce,
-            fee_rate_bps: "0".to_string(), // Maker gets rebates
-            side: order.side.to_string(),
-            signature_type: 0,
+            salt: salt.to_string(),
+            maker: format!("{:?}", maker),
+            signer: format!("{:?}", signer),
+            taker: format!("{:?}", taker),
+            token_id: token_id.to_string(),
+            maker_amount: maker_amount.to_string(),
+            taker_amount: taker_amount.to_string(),
+            expiration: expiration_u256.to_string(),
+            nonce: nonce.to_string(),
+            fee_rate_bps: fee_rate_bps.to_string(),
+            side: match order.side { Side::Buy => "0".to_string(), Side::Sell => "1".to_string() },
+            signature_type: signature_type.as_u64(),
             signature: format!("0x{}", hex::encode(signature.to_vec())),
         })
     }
