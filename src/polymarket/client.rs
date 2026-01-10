@@ -372,58 +372,67 @@ impl PolymarketClient {
     }
 
     /// Fetch active 15-minute crypto binary markets with proper yes/no token mapping
-    /// Uses pagination and specific filters to find "updown" markets
-    /// Retries failed requests up to 3 times
+    /// Uses /events endpoint (NOT /markets) with proper sorting to find updown-15m events
+    /// Supports BTC, ETH, SOL, and XRP
     pub async fn fetch_active_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
         let mut crypto_markets = Vec::new();
-        let limit = 100;
-        let mut offset = 0;
         
-        // Base URL with sorting (newest first by ID) as requested
-        let base_url = format!(
-            "{}/markets?active=true&closed=false&limit={}&order=id&ascending=false&slug_contains=updown",
-            self.gamma_url(),
-            limit
+        // Use /events endpoint with startDate sorting (newest first)
+        // This is where 15-min updown markets actually live!
+        let url = format!(
+            "{}/events?active=true&closed=false&limit=200&order=startDate&ascending=false",
+            self.gamma_url()
         );
 
-        loop {
-            let url = format!("{}&offset={}", base_url, offset);
-            debug!("Fetching markets page: offset={}", offset);
+        info!("Fetching 15-min crypto events from Gamma API...");
+        debug!("Events URL: {}", url);
 
-            // Retry logic (3 attempts)
-            let mut attempts = 0;
-            let response = loop {
-                attempts += 1;
-                match self.http_client.get(&url).send().await {
-                    Ok(resp) => break Ok(resp),
-                    Err(e) => {
-                        if attempts >= 3 {
-                            break Err(e);
-                        }
-                        warn!("Failed to fetch markets (attempt {}/3): {}. Retrying...", attempts, e);
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Retry logic (3 attempts)
+        let mut attempts = 0;
+        let response = loop {
+            attempts += 1;
+            match self.http_client.get(&url).send().await {
+                Ok(resp) => break Ok(resp),
+                Err(e) => {
+                    if attempts >= 3 {
+                        break Err(e);
                     }
+                    warn!("Failed to fetch events (attempt {}/3): {}. Retrying...", attempts, e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
-            }.context("Failed to fetch markets page after 3 attempts")?;
+            }
+        }.context("Failed to fetch events after 3 attempts")?;
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                warn!("Gamma API error {}: {}", status, body);
-                break; // Stop on API error
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Gamma API error {}: {}", status, body);
+        }
+
+        let events_json: Vec<serde_json::Value> = response.json().await
+            .context("Failed to parse events response")?;
+
+        info!("Fetched {} events from Gamma API", events_json.len());
+
+        // Filter for 15-min updown events
+        for event in events_json {
+            let event_slug = event.get("slug")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            
+            // Only process updown-15m events (btc-updown-15m, eth-updown-15m, sol-updown-15m, xrp-updown-15m)
+            if !event_slug.contains("updown-15m") {
+                continue;
             }
 
-            let markets_json: Vec<serde_json::Value> = response.json().await
-                .unwrap_or_default();
+            // Get markets from event
+            let markets = match event.get("markets") {
+                Some(serde_json::Value::Array(arr)) => arr,
+                _ => continue,
+            };
 
-            if markets_json.is_empty() {
-                break; // No more markets
-            }
-
-            let page_count = markets_json.len();
-
-            for market in markets_json {
-                // Check for binary market
+            for market in markets {
+                // Parse clobTokenIds
                 let clob_token_ids_str = market.get("clobTokenIds")
                     .and_then(|v| v.as_str())
                     .unwrap_or("[]");
@@ -432,14 +441,11 @@ impl PolymarketClient {
                     .unwrap_or_default();
                 
                 if token_ids.len() != 2 {
-                    continue; 
+                    continue;
                 }
 
                 // Metadata extraction
                 let title = market.get("question")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let slug = market.get("slug")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let condition_id = market.get("conditionId")
@@ -452,31 +458,20 @@ impl PolymarketClient {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
 
-                let title_lower = title.to_lowercase();
-                let slug_lower = slug.to_lowercase();
-
-                // Strict filter for 15-min / up-down markets
-                // Either strict slug match OR backup title match
-                let is_target_format = slug_lower.contains("updown") 
-                    || slug_lower.contains("up-down")
-                    || (title_lower.contains("up or down") && (title_lower.contains("15m") || title_lower.contains("15 min")));
-
-                if !is_target_format {
-                    continue;
-                }
-
-                // Asset filter
-                let asset = if title_lower.contains("bitcoin") || slug_lower.contains("btc") {
+                // Asset detection from event slug (more reliable)
+                let slug_lower = event_slug.to_lowercase();
+                let asset = if slug_lower.starts_with("btc-") {
                     CryptoAsset::BTC
-                } else if title_lower.contains("ethereum") || slug_lower.contains("eth") {
+                } else if slug_lower.starts_with("eth-") {
                     CryptoAsset::ETH
-                } else if title_lower.contains("solana") || slug_lower.contains("sol") {
+                } else if slug_lower.starts_with("sol-") {
                     CryptoAsset::SOL
                 } else {
-                    continue; // Other asset
+                    // XRP and others - skip for now or add to CryptoAsset enum
+                    continue;
                 };
 
-                // Outcome Mapping (Yes/Up -> Index 0 assumption, verified via outcomes array)
+                // Outcome Mapping (Up -> Index 0, Down -> Index 1)
                 let outcomes_str = market.get("outcomes")
                     .and_then(|v| v.as_str())
                     .unwrap_or("[\"Up\", \"Down\"]");
@@ -495,10 +490,13 @@ impl PolymarketClient {
                     (token_ids[0].clone(), token_ids[1].clone())
                 };
 
-                debug!("Discovered: {} ({}) [Yes: {}...]", slug, asset, &yes_token_id[0..6]);
+                debug!(
+                    "Found 15-min market: {} | {} | Yes: {}...",
+                    event_slug, asset, &yes_token_id[..8.min(yes_token_id.len())]
+                );
 
                 crypto_markets.push(CryptoMarket {
-                    slug: slug.to_string(),
+                    slug: event_slug.to_string(),
                     title: title.to_string(),
                     condition_id: condition_id.to_string(),
                     yes_token_id,
@@ -508,39 +506,29 @@ impl PolymarketClient {
                     accepting_orders: accepting,
                 });
             }
-
-            offset += limit;
-            if page_count < limit {
-                break; // Less than limit means last page
-            }
-            
-            // Safety break 
-            if offset > 2000 {
-                break;
-            }
         }
 
         // Log findings (limit to top 20 to avoid spam)
-        info!("=== DISCOVERED 15-MIN CRYPTO MARKETS (Newest First) ===");
+        info!("=== DISCOVERED 15-MIN CRYPTO MARKETS (from Events API) ===");
         if crypto_markets.is_empty() {
-             warn!("No markets found. Check API connectivity or filters.");
+            warn!("No 15-min crypto markets found. Check if markets are active.");
         } else {
             for (i, cm) in crypto_markets.iter().take(20).enumerate() {
                 info!(
-                    "[{}] {} | {} | Active: {} | IDs: {}... / {}...",
+                    "[{}] {} | {} | Active: {} | Yes: {}... / No: {}...",
                     i + 1,
                     cm.asset,
-                    cm.title.chars().take(40).collect::<String>(),
+                    cm.title.chars().take(45).collect::<String>(),
                     cm.accepting_orders,
-                    &cm.yes_token_id[0..8],
-                    &cm.no_token_id[0..8]
+                    &cm.yes_token_id[..8.min(cm.yes_token_id.len())],
+                    &cm.no_token_id[..8.min(cm.no_token_id.len())]
                 );
             }
             if crypto_markets.len() > 20 {
                 info!("... and {} more markets (monitoring all)", crypto_markets.len() - 20);
             }
         }
-        info!("Total crypto markets found: {}", crypto_markets.len());
+        info!("Total 15-min crypto markets found: {}", crypto_markets.len());
         info!("=========================================");
 
         Ok(crypto_markets)
@@ -606,6 +594,9 @@ impl PolymarketClient {
             anyhow::bail!("API error {}: {}", status, body);
         }
 
+        // Debug: log raw response for troubleshooting
+        debug!("Orderbook response for {}...: {}", &token_id[..8.min(token_id.len())], &body[..200.min(body.len())]);
+
         let ob_response: OrderBookResponse = serde_json::from_str(&body)
             .context("Failed to parse orderbook response")?;
 
@@ -622,6 +613,16 @@ impl PolymarketClient {
             asks: ob_response.asks.iter().map(parse_level).collect(),
             timestamp: chrono::Utc::now(),
         };
+
+        // Log empty orderbook for debugging
+        if orderbook.bids.is_empty() && orderbook.asks.is_empty() {
+            debug!(
+                "Empty orderbook for token {}... | Raw bids: {} | Raw asks: {}",
+                &token_id[..8.min(token_id.len())],
+                ob_response.bids.len(),
+                ob_response.asks.len()
+            );
+        }
 
         Ok(orderbook)
     }
