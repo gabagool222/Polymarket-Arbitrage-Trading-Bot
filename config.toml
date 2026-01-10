@@ -32,7 +32,10 @@ market_slugs = [] # Auto-filled by bot logic
 per_trade_shares = 10.0
 
 # Minimum value to trigger trade (if Yes_price + No_price < this)
-min_profit_threshold = 0.95
+# 0.95 = 5% edge (ketat, jarang trigger)
+# 0.98 = 2% edge (lebih sering trigger)
+# 0.99 = 1% edge (sering trigger, profit kecil per trade)
+min_profit_threshold = 0.99
 
 # Dump trigger: % price drop to initiate Leg 1 buy
 dump_trigger_pct = 0.15
