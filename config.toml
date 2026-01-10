@@ -44,7 +44,8 @@ dump_trigger_pct = 0.15
 spot_move_trigger_pct = 0.5
 
 # Entry window: only trade within first N minutes of round
-entry_window_min = 2
+# Set to 14 to allow trading almost entire round (disable restriction)
+entry_window_min = 14
 
 # Max timeout for completing hedge (Leg 2) in seconds
 max_legs_timeout_sec = 420
@@ -62,7 +63,8 @@ slippage_bps = 50
 max_order_retries = 3
 
 # Minimum edge required to place trade (in cents)
-min_edge_cents = 2
+# Set to 0 to allow any positive edge
+min_edge_cents = 0
 
 [binance_integration]
 # Enable Binance price streaming for latency arbitrage
