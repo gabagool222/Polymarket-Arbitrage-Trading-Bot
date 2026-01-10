@@ -63,6 +63,44 @@ struct ClobTokenData {
     price: Option<f64>,
 }
 
+/// Gamma API event response (for discovering updown markets)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaEvent {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    markets: Vec<GammaMarket>,
+}
+
+/// Gamma API market inside an event
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaMarket {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    condition_id: String,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    end_date: Option<String>,
+    #[serde(default)]
+    clob_token_ids: Option<String>,  // JSON array as string: "[\"id1\", \"id2\"]"
+    #[serde(default)]
+    accepting_orders: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 struct OrderBookResponse {
     bids: Vec<OrderBookLevel>,
@@ -213,29 +251,102 @@ impl PolymarketClient {
         Ok(markets)
     }
 
-    /// Fetch 15-minute crypto markets (BTC/ETH/SOL Up/Down)
+    /// Fetch 15-minute crypto up/down markets from Gamma API events
+    /// Pattern: btc-updown-15m-{timestamp}, eth-updown-15m-{timestamp}, etc.
     pub async fn fetch_15min_crypto_markets(&self) -> Result<Vec<Market>> {
         let mut all_markets = Vec::new();
 
-        for pattern in ["15-min", "15min"] {
-            match self.fetch_markets(pattern).await {
+        // Search patterns for crypto updown 15m events
+        let patterns = ["btc-updown-15m", "eth-updown-15m", "sol-updown-15m"];
+
+        for pattern in patterns {
+            match self.fetch_updown_events(pattern).await {
                 Ok(markets) => {
-                    for market in markets {
-                        let q = market.question.to_lowercase();
-                        if (q.contains("btc") || q.contains("eth") || q.contains("sol"))
-                            && (q.contains("up") || q.contains("down"))
-                        {
-                            all_markets.push(market);
-                        }
-                    }
+                    info!("Found {} markets for pattern '{}'", markets.len(), pattern);
+                    all_markets.extend(markets);
                 }
                 Err(e) => {
-                    warn!("Failed to fetch markets for pattern '{}': {}", pattern, e);
+                    warn!("Failed to fetch events for pattern '{}': {}", pattern, e);
                 }
             }
         }
 
+        info!("Total 15-min crypto markets found: {}", all_markets.len());
         Ok(all_markets)
+    }
+
+    /// Fetch updown events from Gamma API
+    async fn fetch_updown_events(&self, ticker_pattern: &str) -> Result<Vec<Market>> {
+        // Use Gamma API events endpoint with slug_contains
+        let url = format!(
+            "{}/events?active=true&closed=false&limit=20&slug_contains={}",
+            self.gamma_url(),
+            ticker_pattern
+        );
+
+        debug!("Fetching events from Gamma API: {}", url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch events")?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!("Gamma API error {}: {}", status, body);
+        }
+
+        // Parse Gamma events response
+        let events: Vec<GammaEvent> = serde_json::from_str(&body)
+            .context("Failed to parse Gamma events response")?;
+
+        let mut markets = Vec::new();
+
+        for event in events {
+            if !event.active || event.closed {
+                continue;
+            }
+
+            for gm in event.markets {
+                // Parse clobTokenIds JSON array
+                let token_ids: Vec<String> = if let Some(ref clob_ids) = gm.clob_token_ids {
+                    serde_json::from_str(clob_ids).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                // Create tokens from the IDs (usually [Up, Down] or [Yes, No])
+                let tokens: Vec<Token> = token_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| Token {
+                        token_id: id.clone(),
+                        outcome: if i == 0 { "Up".to_string() } else { "Down".to_string() },
+                        price: None,
+                    })
+                    .collect();
+
+                if !tokens.is_empty() {
+                    markets.push(Market {
+                        condition_id: gm.condition_id.clone(),
+                        question_id: gm.condition_id.clone(),
+                        tokens,
+                        slug: gm.slug.unwrap_or_default(),
+                        question: gm.question,
+                        end_date_iso: gm.end_date,
+                        active: true,
+                        closed: false,
+                        accepting_orders: gm.accepting_orders.unwrap_or(true),
+                    });
+                }
+            }
+        }
+
+        Ok(markets)
     }
 
     /// Fetch order book for a token
