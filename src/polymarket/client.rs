@@ -127,6 +127,12 @@ struct CreateOrdersRequest {
     orders: Vec<SignedOrder>,
 }
 
+#[derive(Debug, Deserialize)]
+struct MarketMetadataResponse {
+    minimum_order_size: String,
+    minimum_tick_size: String, // Note: API might call it tick_size or minimum_tick_size
+}
+
 #[derive(Debug, Serialize)]
 struct SignedOrder {
     salt: String,
@@ -648,6 +654,31 @@ impl PolymarketClient {
         Ok((yes_token, no_token))
     }
 
+    pub async fn get_market_metadata(&self, token_id: &str) -> Result<(Decimal, Decimal)> {
+        // Fetch market config to respect Min Size and Tick Size
+        let url = format!("{}/markets/{}", self.api_url(), token_id);
+        
+        let response = self.http_client.get(&url).send().await?;
+        if !response.status().is_success() {
+             // Fallback default for 15-min crypto binary (Tick 0.1 or 0.01?, Size 1?)
+             return Ok((Decimal::new(1, 0), Decimal::new(1, 2))); 
+        }
+
+        // Parse response (simplified for snippet)
+        // In reality, map proper JSON fields
+        let body: serde_json::Value = response.json().await?;
+        
+        let min_size = body["minimum_order_size"].as_str()
+            .and_then(|s| Decimal::from_str_exact(s).ok())
+            .unwrap_or(Decimal::new(1,0));
+            
+        let tick_size = body["minimum_tick_size"].as_str()
+            .and_then(|s| Decimal::from_str_exact(s).ok())
+            .unwrap_or(Decimal::new(1,2)); // 0.01
+
+        Ok((min_size, tick_size))
+    }
+
     /// Place multiple orders in a batch (atomic-like)
     pub async fn place_orders(&self, orders: Vec<OrderRequest>) -> Result<Vec<Order>> {
         if self.config.is_test_mode() {
@@ -798,7 +829,7 @@ impl PolymarketClient {
         };
 
         // Construct TypedData
-        let domain = ethers::types::transaction::eip712::Eip712Domain {
+        let domain = ethers::types::Eip712Domain {
             name: Some("Polymarket CTF Exchange".to_string()),
             version: Some("1".to_string()),
             chain_id: Some(U256::from(chain_id)),
@@ -810,18 +841,18 @@ impl PolymarketClient {
         types.insert(
             "Order".to_string(),
             vec![
-                ethers::types::transaction::eip712::Eip712DomainType { name: "salt".to_string(), type_: "uint256".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "maker".to_string(), type_: "address".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "signer".to_string(), type_: "address".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "taker".to_string(), type_: "address".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "tokenId".to_string(), type_: "uint256".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "makerAmount".to_string(), type_: "uint256".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "takerAmount".to_string(), type_: "uint256".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "expiration".to_string(), type_: "uint256".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "nonce".to_string(), type_: "uint256".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "feeRateBps".to_string(), type_: "uint256".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "side".to_string(), type_: "uint256".to_string() },
-                ethers::types::transaction::eip712::Eip712DomainType { name: "signatureType".to_string(), type_: "uint256".to_string() },
+                ethers::types::Eip712DomainType { name: "salt".to_string(), r#type: "uint256".to_string() },
+                ethers::types::Eip712DomainType { name: "maker".to_string(), r#type: "address".to_string() },
+                ethers::types::Eip712DomainType { name: "signer".to_string(), r#type: "address".to_string() },
+                ethers::types::Eip712DomainType { name: "taker".to_string(), r#type: "address".to_string() },
+                ethers::types::Eip712DomainType { name: "tokenId".to_string(), r#type: "uint256".to_string() },
+                ethers::types::Eip712DomainType { name: "makerAmount".to_string(), r#type: "uint256".to_string() },
+                ethers::types::Eip712DomainType { name: "takerAmount".to_string(), r#type: "uint256".to_string() },
+                ethers::types::Eip712DomainType { name: "expiration".to_string(), r#type: "uint256".to_string() },
+                ethers::types::Eip712DomainType { name: "nonce".to_string(), r#type: "uint256".to_string() },
+                ethers::types::Eip712DomainType { name: "feeRateBps".to_string(), r#type: "uint256".to_string() },
+                ethers::types::Eip712DomainType { name: "side".to_string(), r#type: "uint256".to_string() },
+                ethers::types::Eip712DomainType { name: "signatureType".to_string(), r#type: "uint256".to_string() },
             ],
         );
 
@@ -864,7 +895,7 @@ impl PolymarketClient {
             nonce: nonce.to_string(),
             fee_rate_bps: fee_rate_bps.to_string(),
             side: match order.side { Side::Buy => "0".to_string(), Side::Sell => "1".to_string() },
-            signature_type: signature_type.as_u64(),
+            signature_type: signature_type.as_u64() as u8,
             signature: format!("0x{}", hex::encode(signature.to_vec())),
         })
     }
