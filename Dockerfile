@@ -25,7 +25,6 @@ COPY src ./src
 # Build the release binary
 ENV RUST_BACKTRACE=1
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-ENV CARGO_BUILD_JOBS=1
 RUN cargo build --release
 
 # Runtime stage

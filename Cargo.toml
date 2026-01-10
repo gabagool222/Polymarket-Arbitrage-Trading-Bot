@@ -60,8 +60,8 @@ name = "polyarb"
 path = "src/main.rs"
 
 [profile.release]
-opt-level = "z"
-lto = false
-codegen-units = 1
+opt-level = 3
+lto = "thin"
+codegen-units = 16
 strip = true
 panic = "abort"

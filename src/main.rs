@@ -31,7 +31,7 @@ use clap::Parser;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::binance::{run_binance_ws, BinanceTick, PriceMove};
 use crate::config::{AppConfig, OperatingMode};
