@@ -29,8 +29,9 @@ mod utils;
 use anyhow::{Context, Result};
 use clap::Parser;
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::binance::{run_binance_ws, BinanceTick, PriceMove};
@@ -235,6 +236,12 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
 
     info!("Bot started. Monitoring markets for opportunities...");
 
+    // === PRICE CACHE ===
+    // Store prices from WebSocket to avoid re-fetching orderbooks
+    // Key: token_id, Value: (best_bid, best_ask, last_price, timestamp)
+    type PriceData = (Option<Decimal>, Option<Decimal>, Decimal, chrono::DateTime<chrono::Utc>);
+    let price_cache: Arc<RwLock<HashMap<String, PriceData>>> = Arc::new(RwLock::new(HashMap::new()));
+
     // Main event loop
     let mut last_binance_move: Option<PriceMove> = None;
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -291,29 +298,106 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
             }
             // Handle Polymarket price updates
             Ok(update) = poly_price_rx.recv() => {
+                // Update price cache from WebSocket
+                {
+                    let mut cache = price_cache.write().await;
+                    cache.insert(
+                        update.token_id.clone(),
+                        (update.best_bid, update.best_ask, update.price, update.timestamp)
+                    );
+                }
+
                 // Find the market for this token
                 if let Some(market) = markets.iter().find(|m|
                     m.yes_token_id == update.token_id || m.no_token_id == update.token_id
                 ) {
-                    // Fetch full market prices using crypto specific function
-                    match client.fetch_crypto_market_prices(market).await {
-                        Ok(prices) => {
-                            // Process with trading engine
-                            if let Err(e) = trading_engine.on_market_update(
-                                &prices,
-                                last_binance_move.as_ref(),
-                            ).await {
-                                error!("Trading engine error: {}", e);
+                    // Try to build prices from cache first
+                    let cache = price_cache.read().await;
+                    
+                    let yes_data = cache.get(&market.yes_token_id);
+                    let no_data = cache.get(&market.no_token_id);
+                    
+                    // Calculate prices from cached bid/ask or last_price
+                    let yes_price = yes_data.and_then(|(bid, ask, last_price, _)| {
+                        // Priority: mid_price from bid/ask > last_price
+                        match (bid, ask) {
+                            (Some(b), Some(a)) => Some((*b + *a) / Decimal::new(2, 0)),
+                            (Some(b), None) => Some(*b),
+                            (None, Some(a)) => Some(*a),
+                            (None, None) => Some(*last_price),
+                        }
+                    });
+                    
+                    let no_price = no_data.and_then(|(bid, ask, last_price, _)| {
+                        match (bid, ask) {
+                            (Some(b), Some(a)) => Some((*b + *a) / Decimal::new(2, 0)),
+                            (Some(b), None) => Some(*b),
+                            (None, Some(a)) => Some(*a),
+                            (None, None) => Some(*last_price),
+                        }
+                    });
+                    
+                    drop(cache); // Release read lock
+                    
+                    // Build MarketPrices from cache or fallback to API fetch
+                    let prices = if let (Some(yp), Some(np)) = (yes_price, no_price) {
+                        // Use cached prices
+                        if yp > Decimal::ZERO && np > Decimal::ZERO {
+                            debug!(
+                                "Using cached prices for {}: Yes={:.4} No={:.4} Sum={:.4}",
+                                market.asset, yp, np, yp + np
+                            );
+                            MarketPrices {
+                                condition_id: market.condition_id.clone(),
+                                yes_price: yp,
+                                no_price: np,
+                                yes_token_id: market.yes_token_id.clone(),
+                                no_token_id: market.no_token_id.clone(),
+                                timestamp: chrono::Utc::now(),
                             }
+                        } else {
+                            // Zero prices from cache - fallback to API
+                            warn!("Cached prices are zero, fetching orderbook...");
+                            match client.fetch_crypto_market_prices(market).await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    warn!("Failed to fetch market prices: {}", e);
+                                    continue;
+                                }
+                            }
+                        }
+                    } else {
+                        // Not enough cached data - fallback to API fetch
+                        debug!("Incomplete cache for {}, fetching orderbook...", market.asset);
+                        match client.fetch_crypto_market_prices(market).await {
+                            Ok(p) => {
+                                // Log if we're getting default values
+                                if p.yes_price == Decimal::new(5, 1) && p.no_price == Decimal::new(5, 1) {
+                                    warn!(
+                                        "⚠️ {} orderbook empty! Using defaults (0.50/0.50). Check API.",
+                                        market.asset
+                                    );
+                                }
+                                p
+                            },
+                            Err(e) => {
+                                warn!("Failed to fetch market prices: {}", e);
+                                continue;
+                            }
+                        }
+                    };
 
-                            // Update simulation if in test mode
-                            if let Some(ref sim) = sim_engine {
-                                let _ = sim.update_orders(&prices).await;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to fetch market prices: {}", e);
-                        }
+                    // Process with trading engine
+                    if let Err(e) = trading_engine.on_market_update(
+                        &prices,
+                        last_binance_move.as_ref(),
+                    ).await {
+                        error!("Trading engine error: {}", e);
+                    }
+
+                    // Update simulation if in test mode
+                    if let Some(ref sim) = sim_engine {
+                        let _ = sim.update_orders(&prices).await;
                     }
                 }
             }

@@ -12,11 +12,15 @@ use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-/// Price update event
+/// Price update event with bid/ask from WebSocket
 #[derive(Debug, Clone)]
 pub struct PriceUpdate {
     pub token_id: String,
     pub price: Decimal,
+    /// Best bid from WebSocket (if available)
+    pub best_bid: Option<Decimal>,
+    /// Best ask from WebSocket (if available)
+    pub best_ask: Option<Decimal>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
@@ -282,10 +286,39 @@ impl PolymarketWs {
                         timestamp: chrono::Utc::now(),
                     };
 
+                    // Extract best bid/ask from orderbook
+                    let best_bid = book.best_bid();
+                    let best_ask = book.best_ask();
+                    let mid_price = book.mid_price().unwrap_or_default();
+
                     // Update orderbook cache
                     orderbooks.write().await.insert(asset_id.clone(), book.clone());
 
-                    // Broadcast update
+                    // Also update price cache by broadcasting PriceUpdate with bid/ask
+                    if best_bid.is_some() || best_ask.is_some() {
+                        let price_update = PriceUpdate {
+                            token_id: asset_id.clone(),
+                            price: mid_price,
+                            best_bid,
+                            best_ask,
+                            timestamp: chrono::Utc::now(),
+                        };
+                        
+                        // Update price cache
+                        prices.write().await.insert(asset_id.clone(), mid_price);
+                        
+                        debug!(
+                            "Book Update: {} | bid={:?} | ask={:?} | mid={}",
+                            &asset_id[..8.min(asset_id.len())],
+                            best_bid,
+                            best_ask,
+                            mid_price
+                        );
+                        
+                        let _ = price_tx.send(price_update);
+                    }
+
+                    // Broadcast orderbook update
                     let update = OrderBookUpdate {
                         token_id: asset_id,
                         bids: book.bids,
@@ -306,14 +339,35 @@ impl PolymarketWs {
                 if event_type == "price_change" {
                     for change in price_changes {
                         let price_dec: Decimal = change.price.parse().unwrap_or_default();
+                        
+                        // Parse best_bid and best_ask if available
+                        let best_bid = change.best_bid
+                            .as_ref()
+                            .and_then(|s| s.parse::<Decimal>().ok());
+                        let best_ask = change.best_ask
+                            .as_ref()
+                            .and_then(|s| s.parse::<Decimal>().ok());
 
                         // Update price cache
                         prices.write().await.insert(change.asset_id.clone(), price_dec);
 
-                        // Broadcast update
+                        // Log when we have real bid/ask data
+                        if best_bid.is_some() || best_ask.is_some() {
+                            debug!(
+                                "WS Price: {} | price={} | bid={:?} | ask={:?}",
+                                &change.asset_id[..8.min(change.asset_id.len())],
+                                price_dec,
+                                best_bid,
+                                best_ask
+                            );
+                        }
+
+                        // Broadcast update with bid/ask
                         let update = PriceUpdate {
                             token_id: change.asset_id,
                             price: price_dec,
+                            best_bid,
+                            best_ask,
                             timestamp: chrono::Utc::now(),
                         };
 
@@ -337,6 +391,8 @@ impl PolymarketWs {
                     let update = PriceUpdate {
                         token_id: asset_id,
                         price: price_dec,
+                        best_bid: None,  // Legacy format doesn't have bid/ask
+                        best_ask: None,
                         timestamp: chrono::Utc::now(),
                     };
 
