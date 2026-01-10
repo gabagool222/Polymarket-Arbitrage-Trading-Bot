@@ -24,6 +24,7 @@ COPY src ./src
 # Build the release binary
 # Build the release binary
 ENV RUST_BACKTRACE=1
+ENV CARGO_BUILD_JOBS=1
 RUN cargo build --release
 
 # Runtime stage
