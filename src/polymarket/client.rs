@@ -350,140 +350,159 @@ impl PolymarketClient {
     }
 
     /// Fetch active 15-minute crypto binary markets with proper yes/no token mapping
-    /// Returns Vec<CryptoMarket> with correctly mapped token IDs
+    /// Uses pagination and specific filters to find "updown" markets
     pub async fn fetch_active_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
         let mut crypto_markets = Vec::new();
-
-        // Fetch all active markets from Gamma API
-        let url = format!(
-            "{}/markets?active=true&closed=false&limit=200",
-            self.gamma_url()
+        let limit = 100;
+        let mut offset = 0;
+        
+        // We focus on "updown" slug as generic filter, then refine in loop
+        // If this yields too few results, we might need multiple passes (title_contains, etc)
+        let base_url = format!(
+            "{}/markets?active=true&closed=false&limit={}&ascending=false&slug_contains=updown",
+            self.gamma_url(),
+            limit
         );
 
-        debug!("Fetching markets from Gamma API: {}", url);
+        loop {
+            let url = format!("{}&offset={}", base_url, offset);
+            debug!("Fetching markets page: offset={}", offset);
 
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch markets from Gamma API")?;
+            let response = self
+                .http_client
+                .get(&url)
+                .send()
+                .await
+                .context("Failed to fetch markets page")?;
 
-        let status = response.status();
-        let body = response.text().await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                warn!("Gamma API error {}: {}", status, body);
+                break; // Stop on error
+            }
 
-        if !status.is_success() {
-            anyhow::bail!("Gamma API error {}: {}", status, body);
-        }
-
-        // Parse as JSON Value for flexibility
-        let markets: Vec<serde_json::Value> = serde_json::from_str(&body)
-            .context("Failed to parse Gamma markets response")?;
-
-        for market in markets {
-            // Check if this is a binary market (exactly 2 outcomes)
-            let clob_token_ids_str = market.get("clobTokenIds")
-                .and_then(|v| v.as_str())
-                .unwrap_or("[]");
-            
-            let token_ids: Vec<String> = serde_json::from_str(clob_token_ids_str)
+            let markets_json: Vec<serde_json::Value> = response.json().await
                 .unwrap_or_default();
-            
-            if token_ids.len() != 2 {
-                continue; // Not a binary market
+
+            if markets_json.is_empty() {
+                break; // No more markets
             }
 
-            // Get title and slug
-            let title = market.get("question")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let slug = market.get("slug")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let condition_id = market.get("conditionId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let end_date = market.get("endDate")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let accepting = market.get("acceptingOrders")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+            let page_count = markets_json.len();
 
-            let title_lower = title.to_lowercase();
-            let slug_lower = slug.to_lowercase();
-
-            // Check if it's a 15-min crypto market
-            let is_15min = slug_lower.contains("updown-15m") 
-                || slug_lower.contains("15m")
-                || title_lower.contains("15 minute")
-                || title_lower.contains("15m")
-                || (title_lower.contains("up or down") && title_lower.contains(":"));
-            
-            if !is_15min {
-                continue;
-            }
-
-            // Determine crypto asset
-            let asset = if title_lower.contains("bitcoin") || slug_lower.contains("btc") {
-                CryptoAsset::BTC
-            } else if title_lower.contains("ethereum") || slug_lower.contains("eth") {
-                CryptoAsset::ETH
-            } else if title_lower.contains("solana") || slug_lower.contains("sol") {
-                CryptoAsset::SOL
-            } else {
-                continue; // Not a BTC/ETH/SOL market
-            };
-
-            // Parse outcomes to determine yes/no token mapping
-            // Gamma returns outcomes as JSON string: "[\"Up\", \"Down\"]" or "[\"Yes\", \"No\"]"
-            let outcomes_str = market.get("outcomes")
-                .and_then(|v| v.as_str())
-                .unwrap_or("[\"Up\", \"Down\"]");
-            
-            let outcomes: Vec<String> = serde_json::from_str(outcomes_str)
-                .unwrap_or_else(|_| vec!["Up".to_string(), "Down".to_string()]);
-
-            // Map yes_token (Up/Yes = index 0) and no_token (Down/No = index 1)
-            // Typically: outcomes[0] = "Up" or "Yes", outcomes[1] = "Down" or "No"
-            let (yes_token_id, no_token_id) = if outcomes.len() >= 2 {
-                let first_outcome = outcomes[0].to_lowercase();
-                if first_outcome == "up" || first_outcome == "yes" {
-                    (token_ids[0].clone(), token_ids[1].clone())
-                } else {
-                    // Reversed order
-                    (token_ids[1].clone(), token_ids[0].clone())
+            for market in markets_json {
+                // Check for binary market
+                let clob_token_ids_str = market.get("clobTokenIds")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("[]");
+                
+                let token_ids: Vec<String> = serde_json::from_str(clob_token_ids_str)
+                    .unwrap_or_default();
+                
+                if token_ids.len() != 2 {
+                    continue; 
                 }
-            } else {
-                // Default: first is yes/up
-                (token_ids[0].clone(), token_ids[1].clone())
-            };
 
-            let crypto_market = CryptoMarket {
-                slug: slug.to_string(),
-                title: title.to_string(),
-                condition_id: condition_id.to_string(),
-                yes_token_id,
-                no_token_id,
-                asset,
-                end_time: end_date,
-                accepting_orders: accepting,
-            };
+                // Metadata extraction
+                let title = market.get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let slug = market.get("slug")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let condition_id = market.get("conditionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let end_date = market.get("endDate")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let accepting = market.get("acceptingOrders")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
 
-            crypto_markets.push(crypto_market);
+                let title_lower = title.to_lowercase();
+                let slug_lower = slug.to_lowercase();
+
+                // Strict filter for 15-min / up-down markets
+                let is_target_format = slug_lower.contains("updown") 
+                    || slug_lower.contains("up-down")
+                    || (title_lower.contains("up or down") && (title_lower.contains("15m") || title_lower.contains("15 min")));
+
+                if !is_target_format {
+                    continue;
+                }
+
+                // Asset filter
+                let asset = if title_lower.contains("bitcoin") || slug_lower.contains("btc") {
+                    CryptoAsset::BTC
+                } else if title_lower.contains("ethereum") || slug_lower.contains("eth") {
+                    CryptoAsset::ETH
+                } else if title_lower.contains("solana") || slug_lower.contains("sol") {
+                    CryptoAsset::SOL
+                } else {
+                    continue; // Other asset
+                };
+
+                // Outcome Mapping (Yes/Up -> Index 0 assumption, verified via outcomes array)
+                let outcomes_str = market.get("outcomes")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("[\"Up\", \"Down\"]");
+                
+                let outcomes: Vec<String> = serde_json::from_str(outcomes_str)
+                    .unwrap_or_else(|_| vec!["Up".to_string(), "Down".to_string()]);
+
+                let (yes_token_id, no_token_id) = if outcomes.len() >= 2 {
+                    let first = outcomes[0].to_lowercase();
+                    if first == "up" || first == "yes" {
+                        (token_ids[0].clone(), token_ids[1].clone())
+                    } else {
+                        (token_ids[1].clone(), token_ids[0].clone())
+                    }
+                } else {
+                    (token_ids[0].clone(), token_ids[1].clone())
+                };
+
+                crypto_markets.push(CryptoMarket {
+                    slug: slug.to_string(),
+                    title: title.to_string(),
+                    condition_id: condition_id.to_string(),
+                    yes_token_id,
+                    no_token_id,
+                    asset,
+                    end_time: end_date,
+                    accepting_orders: accepting,
+                });
+            }
+
+            offset += limit;
+            if page_count < limit {
+                break; // Less than limit means last page
+            }
+            
+            // Safety break to prevent infinite loops
+            if offset > 1000 {
+                warn!("Reached pagination safety limit (1000 markets)");
+                break;
+            }
         }
 
-        // Log discovered markets for debugging
+        // Log findings
         info!("=== DISCOVERED 15-MIN CRYPTO MARKETS ===");
-        for (i, cm) in crypto_markets.iter().enumerate() {
-            info!(
-                "[{}] {} | {} | yes_token: {}... | no_token: {}...",
-                i + 1,
-                cm.asset,
-                cm.title.chars().take(50).collect::<String>(),
-                cm.yes_token_id.chars().take(20).collect::<String>(),
-                cm.no_token_id.chars().take(20).collect::<String>()
-            );
+        if crypto_markets.is_empty() {
+             warn!("No markets found with query: slug_contains=updown. Check API or market availability.");
+        } else {
+            for (i, cm) in crypto_markets.iter().enumerate() {
+                info!(
+                    "[{}] {} | {} | Active: {} | IDs: {}... / {}...",
+                    i + 1,
+                    cm.asset,
+                    cm.title.chars().take(40).collect::<String>(),
+                    cm.accepting_orders,
+                    &cm.yes_token_id[0..8],
+                    &cm.no_token_id[0..8]
+                );
+            }
         }
         info!("Total crypto markets found: {}", crypto_markets.len());
         info!("=========================================");
