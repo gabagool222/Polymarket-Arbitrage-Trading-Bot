@@ -368,12 +368,21 @@ impl PolymarketClient {
             let url = format!("{}&offset={}", base_url, offset);
             debug!("Fetching markets page: offset={}", offset);
 
-            let response = self
-                .http_client
-                .get(&url)
-                .send()
-                .await
-                .context("Failed to fetch markets page")?;
+            // Retry logic (3 attempts)
+            let mut attempts = 0;
+            let response = loop {
+                attempts += 1;
+                match self.http_client.get(&url).send().await {
+                    Ok(resp) => break Ok(resp),
+                    Err(e) => {
+                        if attempts >= 3 {
+                            break Err(e);
+                        }
+                        warn!("Failed to fetch markets (attempt {}/3): {}. Retrying...", attempts, e);
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }.context("Failed to fetch markets page after 3 attempts")?;
 
             if !response.status().is_success() {
                 let status = response.status();
