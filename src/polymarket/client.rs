@@ -498,12 +498,12 @@ impl PolymarketClient {
             }
         }
 
-        // Log findings
-        info!("=== DISCOVERED 15-MIN CRYPTO MARKETS ===");
+        // Log findings (limit to top 20 to avoid spam)
+        info!("=== DISCOVERED 15-MIN CRYPTO MARKETS (Newest First) ===");
         if crypto_markets.is_empty() {
              warn!("No markets found. Check API connectivity or filters.");
         } else {
-            for (i, cm) in crypto_markets.iter().enumerate() {
+            for (i, cm) in crypto_markets.iter().take(20).enumerate() {
                 info!(
                     "[{}] {} | {} | Active: {} | IDs: {}... / {}...",
                     i + 1,
@@ -513,6 +513,9 @@ impl PolymarketClient {
                     &cm.yes_token_id[0..8],
                     &cm.no_token_id[0..8]
                 );
+            }
+            if crypto_markets.len() > 20 {
+                info!("... and {} more markets (monitoring all)", crypto_markets.len() - 20);
             }
         }
         info!("Total crypto markets found: {}", crypto_markets.len());
