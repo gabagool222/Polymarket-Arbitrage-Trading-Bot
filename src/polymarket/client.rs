@@ -349,6 +349,188 @@ impl PolymarketClient {
         Ok(markets)
     }
 
+    /// Fetch active 15-minute crypto binary markets with proper yes/no token mapping
+    /// Returns Vec<CryptoMarket> with correctly mapped token IDs
+    pub async fn fetch_active_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
+        let mut crypto_markets = Vec::new();
+
+        // Fetch all active markets from Gamma API
+        let url = format!(
+            "{}/markets?active=true&closed=false&limit=200",
+            self.gamma_url()
+        );
+
+        debug!("Fetching markets from Gamma API: {}", url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch markets from Gamma API")?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!("Gamma API error {}: {}", status, body);
+        }
+
+        // Parse as JSON Value for flexibility
+        let markets: Vec<serde_json::Value> = serde_json::from_str(&body)
+            .context("Failed to parse Gamma markets response")?;
+
+        for market in markets {
+            // Check if this is a binary market (exactly 2 outcomes)
+            let clob_token_ids_str = market.get("clobTokenIds")
+                .and_then(|v| v.as_str())
+                .unwrap_or("[]");
+            
+            let token_ids: Vec<String> = serde_json::from_str(clob_token_ids_str)
+                .unwrap_or_default();
+            
+            if token_ids.len() != 2 {
+                continue; // Not a binary market
+            }
+
+            // Get title and slug
+            let title = market.get("question")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let slug = market.get("slug")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let condition_id = market.get("conditionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let end_date = market.get("endDate")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let accepting = market.get("acceptingOrders")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            let title_lower = title.to_lowercase();
+            let slug_lower = slug.to_lowercase();
+
+            // Check if it's a 15-min crypto market
+            let is_15min = slug_lower.contains("updown-15m") 
+                || slug_lower.contains("15m")
+                || title_lower.contains("15 minute")
+                || title_lower.contains("15m")
+                || (title_lower.contains("up or down") && title_lower.contains(":"));
+            
+            if !is_15min {
+                continue;
+            }
+
+            // Determine crypto asset
+            let asset = if title_lower.contains("bitcoin") || slug_lower.contains("btc") {
+                CryptoAsset::BTC
+            } else if title_lower.contains("ethereum") || slug_lower.contains("eth") {
+                CryptoAsset::ETH
+            } else if title_lower.contains("solana") || slug_lower.contains("sol") {
+                CryptoAsset::SOL
+            } else {
+                continue; // Not a BTC/ETH/SOL market
+            };
+
+            // Parse outcomes to determine yes/no token mapping
+            // Gamma returns outcomes as JSON string: "[\"Up\", \"Down\"]" or "[\"Yes\", \"No\"]"
+            let outcomes_str = market.get("outcomes")
+                .and_then(|v| v.as_str())
+                .unwrap_or("[\"Up\", \"Down\"]");
+            
+            let outcomes: Vec<String> = serde_json::from_str(outcomes_str)
+                .unwrap_or_else(|_| vec!["Up".to_string(), "Down".to_string()]);
+
+            // Map yes_token (Up/Yes = index 0) and no_token (Down/No = index 1)
+            // Typically: outcomes[0] = "Up" or "Yes", outcomes[1] = "Down" or "No"
+            let (yes_token_id, no_token_id) = if outcomes.len() >= 2 {
+                let first_outcome = outcomes[0].to_lowercase();
+                if first_outcome == "up" || first_outcome == "yes" {
+                    (token_ids[0].clone(), token_ids[1].clone())
+                } else {
+                    // Reversed order
+                    (token_ids[1].clone(), token_ids[0].clone())
+                }
+            } else {
+                // Default: first is yes/up
+                (token_ids[0].clone(), token_ids[1].clone())
+            };
+
+            let crypto_market = CryptoMarket {
+                slug: slug.to_string(),
+                title: title.to_string(),
+                condition_id: condition_id.to_string(),
+                yes_token_id,
+                no_token_id,
+                asset,
+                end_time: end_date,
+                accepting_orders: accepting,
+            };
+
+            crypto_markets.push(crypto_market);
+        }
+
+        // Log discovered markets for debugging
+        info!("=== DISCOVERED 15-MIN CRYPTO MARKETS ===");
+        for (i, cm) in crypto_markets.iter().enumerate() {
+            info!(
+                "[{}] {} | {} | yes_token: {}... | no_token: {}...",
+                i + 1,
+                cm.asset,
+                cm.title.chars().take(50).collect::<String>(),
+                cm.yes_token_id.chars().take(20).collect::<String>(),
+                cm.no_token_id.chars().take(20).collect::<String>()
+            );
+        }
+        info!("Total crypto markets found: {}", crypto_markets.len());
+        info!("=========================================");
+
+        Ok(crypto_markets)
+    }
+
+    /// Fetch current prices for a crypto market using token IDs
+    pub async fn fetch_crypto_market_prices(&self, market: &CryptoMarket) -> Result<MarketPrices> {
+        // Fetch orderbooks for both tokens
+        let yes_book = self.fetch_orderbook(&market.yes_token_id).await?;
+        let no_book = self.fetch_orderbook(&market.no_token_id).await?;
+
+        // Get mid prices (or best available)
+        let yes_price = yes_book.mid_price().unwrap_or(Decimal::new(5, 1)); // Default 0.5
+        let no_price = no_book.mid_price().unwrap_or(Decimal::new(5, 1)); // Default 0.5
+
+        let prices = MarketPrices {
+            condition_id: market.condition_id.clone(),
+            yes_price,
+            no_price,
+            yes_token_id: market.yes_token_id.clone(),
+            no_token_id: market.no_token_id.clone(),
+            timestamp: chrono::Utc::now(),
+        };
+
+        debug!(
+            "Prices for {}: yes={}, no={}, sum={}",
+            market.asset,
+            yes_price,
+            no_price,
+            prices.price_sum()
+        );
+
+        Ok(prices)
+    }
+
+    /// Get all token IDs from discovered crypto markets (for WebSocket subscription)
+    pub fn get_all_token_ids(markets: &[CryptoMarket]) -> Vec<String> {
+        let mut token_ids = Vec::new();
+        for m in markets {
+            token_ids.push(m.yes_token_id.clone());
+            token_ids.push(m.no_token_id.clone());
+        }
+        token_ids
+    }
+
     /// Fetch order book for a token
     pub async fn fetch_orderbook(&self, token_id: &str) -> Result<OrderBook> {
         let url = format!("{}/book?token_id={}", self.api_url(), token_id);

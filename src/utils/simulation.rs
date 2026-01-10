@@ -111,11 +111,13 @@ impl SimulationEngine {
             }
 
             // Determine if order can be filled based on current prices
-            let market_price = if order.token_id.contains("yes") || order.token_id.ends_with("_yes")
-            {
+            // Match using token IDs from market prices
+            let market_price = if order.token_id == market_prices.yes_token_id {
                 market_prices.yes_price
-            } else {
+            } else if order.token_id == market_prices.no_token_id {
                 market_prices.no_price
+            } else {
+                continue; // Order doesn't belong to this market update
             };
 
             let can_fill = match order.side {

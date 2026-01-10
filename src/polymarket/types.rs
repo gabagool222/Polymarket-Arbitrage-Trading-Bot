@@ -52,6 +52,57 @@ pub struct Market {
     pub accepting_orders: bool,
 }
 
+/// Crypto asset type for 15-min markets
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CryptoAsset {
+    BTC,
+    ETH,
+    SOL,
+}
+
+impl std::fmt::Display for CryptoAsset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CryptoAsset::BTC => write!(f, "BTC"),
+            CryptoAsset::ETH => write!(f, "ETH"),
+            CryptoAsset::SOL => write!(f, "SOL"),
+        }
+    }
+}
+
+impl CryptoAsset {
+    /// Get Binance symbol for this asset
+    pub fn binance_symbol(&self) -> &'static str {
+        match self {
+            CryptoAsset::BTC => "btcusdt",
+            CryptoAsset::ETH => "ethusdt",
+            CryptoAsset::SOL => "solusdt",
+        }
+    }
+}
+
+/// 15-minute crypto Up/Down binary market
+/// Specifically designed for BTC/ETH/SOL 15-min markets on Polymarket
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CryptoMarket {
+    /// Market slug/identifier
+    pub slug: String,
+    /// Market title (e.g. "Bitcoin Up or Down - January 9, 7:00PM-7:15PM ET")
+    pub title: String,
+    /// Condition ID from Polymarket
+    pub condition_id: String,
+    /// Token ID for "Up" or "Yes" outcome (first positive outcome)
+    pub yes_token_id: String,
+    /// Token ID for "Down" or "No" outcome (second outcome)
+    pub no_token_id: String,
+    /// Crypto asset (BTC, ETH, SOL)
+    pub asset: CryptoAsset,
+    /// Market end time
+    pub end_time: Option<String>,
+    /// Whether market is accepting orders
+    pub accepting_orders: bool,
+}
+
 /// Token information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Token {

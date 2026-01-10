@@ -183,23 +183,21 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
 
     info!("Fetching available 15-min crypto markets...");
 
-    // Fetch markets
-    let markets = client.fetch_15min_crypto_markets().await?;
+    // Fetch markets (active 15-min crypto binary)
+    let markets = client.fetch_active_crypto_markets().await?;
 
     if markets.is_empty() {
         warn!("No active 15-min crypto markets found. Will retry...");
     } else {
-        info!("Found {} active markets:", markets.len());
+        info!("Found {} active crypto markets:", markets.len());
         for market in &markets {
-            info!("  - {} ({})", market.question, market.condition_id);
+            info!("  - {} ({}) [{}]", market.title, market.condition_id, market.asset);
         }
     }
 
     // Collect token IDs for WebSocket subscriptions
-    let token_ids: Vec<String> = markets
-        .iter()
-        .flat_map(|m| m.tokens.iter().map(|t| t.token_id.clone()))
-        .collect();
+    // Collect token IDs for WebSocket subscriptions
+    let token_ids = PolymarketClient::get_all_token_ids(&markets);
 
     // Spawn Polymarket WebSocket task
     let poly_config = Arc::clone(&config);
@@ -245,10 +243,10 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
             Ok(update) = poly_price_rx.recv() => {
                 // Find the market for this token
                 if let Some(market) = markets.iter().find(|m|
-                    m.tokens.iter().any(|t| t.token_id == update.token_id)
+                    m.yes_token_id == update.token_id || m.no_token_id == update.token_id
                 ) {
-                    // Fetch full market prices
-                    match client.fetch_market_prices(market).await {
+                    // Fetch full market prices using crypto specific function
+                    match client.fetch_crypto_market_prices(market).await {
                         Ok(prices) => {
                             // Process with trading engine
                             if let Err(e) = trading_engine.on_market_update(
