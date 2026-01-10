@@ -11,6 +11,7 @@ pub struct Signal {
     pub signal_type: SignalType,
     pub market_id: String,
     pub token_type: TokenType,
+    pub token_id: Option<String>,
     pub suggested_price: Decimal,
     pub suggested_size: Decimal,
     pub confidence: Decimal,
