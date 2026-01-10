@@ -199,23 +199,13 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
     let mut current_token_ids = PolymarketClient::get_all_token_ids(&markets);
 
     // Spawn Polymarket WebSocket task
-    let poly_config = Arc::clone(&config);
-    let poly_tokens = current_token_ids.clone();
-    let poly_price_tx_clone = poly_price_tx.clone();
-    let poly_book_tx_clone = poly_book_tx.clone();
-    
-    let mut poly_ws_handle = tokio::spawn(async move {
-        if let Err(e) = run_polymarket_ws(
-            poly_config,
-            poly_tokens,
-            poly_price_tx_clone,
-            poly_book_tx_clone,
-        )
-        .await
-        {
-            error!("Polymarket WebSocket error: {}", e);
-        }
-    });
+    // Spawn Polymarket WebSocket task
+    let mut poly_ws_handle = start_ws_task(
+        Arc::clone(&config),
+        current_token_ids.clone(),
+        poly_price_tx.clone(),
+        poly_book_tx.clone(),
+    );
 
     // Spawn Binance WebSocket task (if enabled)
     if config.binance.enabled {
@@ -259,23 +249,13 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
                             poly_ws_handle.abort();
                             
                             // Spawn new WS task
-                            let poly_config = Arc::clone(&config);
-                            let poly_tokens = new_token_ids.clone();
-                            let poly_price_tx_clone = poly_price_tx.clone();
-                            let poly_book_tx_clone = poly_book_tx.clone();
-                            
-                            poly_ws_handle = tokio::spawn(async move {
-                                if let Err(e) = run_polymarket_ws(
-                                    poly_config,
-                                    poly_tokens,
-                                    poly_price_tx_clone,
-                                    poly_book_tx_clone,
-                                )
-                                .await
-                                {
-                                    error!("Polymarket WebSocket error: {}", e);
-                                }
-                            });
+                            // Spawn new WS task
+                            poly_ws_handle = start_ws_task(
+                                Arc::clone(&config),
+                                new_token_ids.clone(),
+                                poly_price_tx.clone(),
+                                poly_book_tx.clone(),
+                            );
                             
                             // Update state
                             markets = new_markets;
@@ -388,4 +368,17 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
     info!("Bot shutdown complete.");
 
     Ok(())
+}
+
+fn start_ws_task(
+    config: Arc<AppConfig>,
+    token_ids: Vec<String>,
+    price_tx: broadcast::Sender<PriceUpdate>,
+    book_tx: broadcast::Sender<OrderBookUpdate>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = run_polymarket_ws(config, token_ids, price_tx, book_tx).await {
+            error!("Polymarket WebSocket error: {}", e);
+        }
+    })
 }
