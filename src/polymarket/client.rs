@@ -52,6 +52,9 @@ struct ClobMarketData {
     closed: bool,
     #[serde(default)]
     accepting_orders: bool,
+    /// CLOB token IDs - index 0 = Yes/Up, index 1 = No/Down
+    #[serde(default, rename = "clobTokenIds")]
+    clob_token_ids: Vec<String>,
 }
 
 /// Token data from CLOB API
@@ -236,24 +239,31 @@ impl PolymarketClient {
 
         let markets: Vec<Market> = markets_data
             .into_iter()
-            .map(|m| Market {
-                condition_id: m.condition_id.clone(),
-                question_id: m.question_id.unwrap_or_else(|| m.condition_id),
-                tokens: m
-                    .tokens
-                    .into_iter()
-                    .map(|t| Token {
-                        token_id: t.token_id,
-                        outcome: t.outcome,
-                        price: t.price.map(|p| Decimal::try_from(p).unwrap_or_default()),
-                    })
-                    .collect(),
-                slug: m.market_slug.unwrap_or_default(),
-                question: m.question,
-                end_date_iso: m.end_date_iso,
-                active: m.active,
-                closed: m.closed,
-                accepting_orders: m.accepting_orders,
+            .map(|m| {
+                let clob_token_ids = m.clob_token_ids
+                    .iter()
+                    .map(|s| s.clone())
+                    .collect::<Vec<_>>();
+                Market {
+                    condition_id: m.condition_id.clone(),
+                    question_id: m.question_id.unwrap_or_else(|| m.condition_id),
+                    tokens: m
+                        .tokens
+                        .into_iter()
+                        .map(|t| Token {
+                            token_id: t.token_id,
+                            outcome: t.outcome,
+                            price: t.price.map(|p| Decimal::try_from(p).unwrap_or_default()),
+                        })
+                        .collect(),
+                    slug: m.market_slug.unwrap_or_default(),
+                    question: m.question,
+                    end_date_iso: m.end_date_iso,
+                    active: m.active,
+                    closed: m.closed,
+                    accepting_orders: m.accepting_orders,
+                    clob_token_ids,
+                }
             })
             .collect();
 
@@ -352,6 +362,7 @@ impl PolymarketClient {
                         active: true,
                         closed: false,
                         accepting_orders: gm.accepting_orders.unwrap_or(true),
+                        clob_token_ids: token_ids.clone(),
                     });
                 }
             }

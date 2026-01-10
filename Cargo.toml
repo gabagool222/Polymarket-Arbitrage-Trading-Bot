@@ -52,6 +52,14 @@ async-channel = "2.1"
 # UUID for order IDs
 uuid = { version = "1.6", features = ["v4"] }
 
+# Random number generation (for order salts)
+rand = "0.8"
+
+# HMAC for API authentication
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.21"
+
 [features]
 default = []
 
