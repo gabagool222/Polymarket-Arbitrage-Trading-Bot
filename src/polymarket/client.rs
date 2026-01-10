@@ -828,54 +828,55 @@ impl PolymarketClient {
             Side::Sell => (size_u256, cost_u256),
         };
 
-        // Construct TypedData
-        let domain = ethers::types::Eip712Domain {
-            name: Some("Polymarket CTF Exchange".to_string()),
-            version: Some("1".to_string()),
-            chain_id: Some(U256::from(chain_id)),
-            verifying_contract: Some(verifying_contract),
-            salt: None,
-        };
+        // Create TypedData via JSON to avoid struct import issues
+        let typed_data_json = serde_json::json!({
+            "domain": {
+                "name": "Polymarket CTF Exchange",
+                "version": "1",
+                "chainId": chain_id,
+                "verifyingContract": verifying_contract,
+            },
+            "types": {
+                "EIP712Domain": [
+                    { "name": "name", "type": "string" },
+                    { "name": "version", "type": "string" },
+                    { "name": "chainId", "type": "uint256" },
+                    { "name": "verifyingContract", "type": "address" },
+                ],
+                "Order": [
+                    { "name": "salt", "type": "uint256" },
+                    { "name": "maker", "type": "address" },
+                    { "name": "signer", "type": "address" },
+                    { "name": "taker", "type": "address" },
+                    { "name": "tokenId", "type": "uint256" },
+                    { "name": "makerAmount", "type": "uint256" },
+                    { "name": "takerAmount", "type": "uint256" },
+                    { "name": "expiration", "type": "uint256" },
+                    { "name": "nonce", "type": "uint256" },
+                    { "name": "feeRateBps", "type": "uint256" },
+                    { "name": "side", "type": "uint256" },
+                    { "name": "signatureType", "type": "uint256" },
+                ]
+            },
+            "primaryType": "Order",
+            "message": {
+                "salt": salt.to_string(),
+                "maker": format!("{:?}", maker),
+                "signer": format!("{:?}", signer),
+                "taker": format!("{:?}", taker),
+                "tokenId": token_id.to_string(),
+                "makerAmount": maker_amount.to_string(),
+                "takerAmount": taker_amount.to_string(),
+                "expiration": expiration_u256.to_string(),
+                "nonce": nonce.to_string(),
+                "feeRateBps": fee_rate_bps.to_string(),
+                "side": match order.side { Side::Buy => "0".to_string(), Side::Sell => "1".to_string() },
+                "signatureType": signature_type.to_string()
+            }
+        });
 
-        let mut types = std::collections::BTreeMap::new();
-        types.insert(
-            "Order".to_string(),
-            vec![
-                ethers::types::Eip712DomainType { name: "salt".to_string(), r#type: "uint256".to_string() },
-                ethers::types::Eip712DomainType { name: "maker".to_string(), r#type: "address".to_string() },
-                ethers::types::Eip712DomainType { name: "signer".to_string(), r#type: "address".to_string() },
-                ethers::types::Eip712DomainType { name: "taker".to_string(), r#type: "address".to_string() },
-                ethers::types::Eip712DomainType { name: "tokenId".to_string(), r#type: "uint256".to_string() },
-                ethers::types::Eip712DomainType { name: "makerAmount".to_string(), r#type: "uint256".to_string() },
-                ethers::types::Eip712DomainType { name: "takerAmount".to_string(), r#type: "uint256".to_string() },
-                ethers::types::Eip712DomainType { name: "expiration".to_string(), r#type: "uint256".to_string() },
-                ethers::types::Eip712DomainType { name: "nonce".to_string(), r#type: "uint256".to_string() },
-                ethers::types::Eip712DomainType { name: "feeRateBps".to_string(), r#type: "uint256".to_string() },
-                ethers::types::Eip712DomainType { name: "side".to_string(), r#type: "uint256".to_string() },
-                ethers::types::Eip712DomainType { name: "signatureType".to_string(), r#type: "uint256".to_string() },
-            ],
-        );
-
-        let mut message = std::collections::BTreeMap::new();
-        message.insert("salt".to_string(), serde_json::json!(salt.to_string()));
-        message.insert("maker".to_string(), serde_json::json!(format!("{:?}", maker)));
-        message.insert("signer".to_string(), serde_json::json!(format!("{:?}", signer)));
-        message.insert("taker".to_string(), serde_json::json!(format!("{:?}", taker)));
-        message.insert("tokenId".to_string(), serde_json::json!(token_id.to_string()));
-        message.insert("makerAmount".to_string(), serde_json::json!(maker_amount.to_string()));
-        message.insert("takerAmount".to_string(), serde_json::json!(taker_amount.to_string()));
-        message.insert("expiration".to_string(), serde_json::json!(expiration_u256.to_string()));
-        message.insert("nonce".to_string(), serde_json::json!(nonce.to_string()));
-        message.insert("feeRateBps".to_string(), serde_json::json!(fee_rate_bps.to_string()));
-        message.insert("side".to_string(), serde_json::json!(side_int.to_string()));
-        message.insert("signatureType".to_string(), serde_json::json!(signature_type.to_string()));
-
-        let typed_data = ethers::types::transaction::eip712::TypedData {
-            domain,
-            types,
-            primary_type: "Order".to_string(),
-            message,
-        };
+        let typed_data: ethers::types::transaction::eip712::TypedData = serde_json::from_value(typed_data_json)
+            .context("Failed to construct TypedData from JSON")?;
 
         // Sign Typed Data
         let signature = wallet
