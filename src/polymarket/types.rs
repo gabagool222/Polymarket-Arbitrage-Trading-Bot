@@ -50,6 +50,21 @@ pub struct Market {
     pub active: bool,
     pub closed: bool,
     pub accepting_orders: bool,
+    /// CLOB token IDs from Gamma API - index 0 = Yes/Up, index 1 = No/Down
+    #[serde(default)]
+    pub clob_token_ids: Vec<String>,
+}
+
+impl Market {
+    /// Get Yes/Up token ID (index 0)
+    pub fn yes_token_id(&self) -> Option<&str> {
+        self.clob_token_ids.get(0).map(|s| s.as_str())
+    }
+
+    /// Get No/Down token ID (index 1)
+    pub fn no_token_id(&self) -> Option<&str> {
+        self.clob_token_ids.get(1).map(|s| s.as_str())
+    }
 }
 
 /// Token information

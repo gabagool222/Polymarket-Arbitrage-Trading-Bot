@@ -67,6 +67,9 @@ struct MarketData {
     active: bool,
     closed: bool,
     accepting_orders: bool,
+    /// CLOB token IDs from Gamma API - index 0 = Yes/Up, index 1 = No/Down
+    #[serde(default, rename = "clobTokenIds")]
+    clob_token_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,9 +259,10 @@ impl PolymarketClient {
     }
 
     /// Fetch markets matching slug patterns
+    /// FIX: Changed slug_filter to slug_contains (correct Gamma API param)
     pub async fn fetch_markets(&self, slug_pattern: &str) -> Result<Vec<Market>> {
         let url = format!(
-            "{}/markets?slug_filter={}&active=true&closed=false",
+            "{}/markets?slug_contains={}&active=true&closed=false&limit=100",
             self.gamma_url(),
             slug_pattern
         );
@@ -284,24 +288,35 @@ impl PolymarketClient {
 
         let markets: Vec<Market> = markets_data
             .into_iter()
-            .map(|m| Market {
-                condition_id: m.condition_id,
-                question_id: m.question_id,
-                tokens: m
-                    .tokens
-                    .into_iter()
-                    .map(|t| Token {
-                        token_id: t.token_id,
-                        outcome: t.outcome,
-                        price: t.price.map(|p| Decimal::try_from(p).unwrap_or_default()),
-                    })
-                    .collect(),
-                slug: m.slug.unwrap_or_default(),
-                question: m.question,
-                end_date_iso: m.end_date_iso,
-                active: m.active,
-                closed: m.closed,
-                accepting_orders: m.accepting_orders,
+            .map(|m| {
+                // Use clobTokenIds if available, otherwise fall back to tokens array
+                let clob_token_ids = if !m.clob_token_ids.is_empty() {
+                    m.clob_token_ids
+                } else {
+                    // Fallback: extract from tokens array
+                    m.tokens.iter().map(|t| t.token_id.clone()).collect()
+                };
+
+                Market {
+                    condition_id: m.condition_id,
+                    question_id: m.question_id,
+                    tokens: m
+                        .tokens
+                        .into_iter()
+                        .map(|t| Token {
+                            token_id: t.token_id,
+                            outcome: t.outcome,
+                            price: t.price.map(|p| Decimal::try_from(p).unwrap_or_default()),
+                        })
+                        .collect(),
+                    slug: m.slug.unwrap_or_default(),
+                    question: m.question,
+                    end_date_iso: m.end_date_iso,
+                    active: m.active,
+                    closed: m.closed,
+                    accepting_orders: m.accepting_orders,
+                    clob_token_ids,
+                }
             })
             .collect();
 
@@ -311,17 +326,48 @@ impl PolymarketClient {
     }
 
     /// Fetch 15-minute crypto markets (BTC/ETH/SOL Up/Down)
+    /// FIX: Improved filter to match actual 15-min market slugs
     pub async fn fetch_15min_crypto_markets(&self) -> Result<Vec<Market>> {
         let mut all_markets = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
 
-        for pattern in ["15-min", "15min"] {
+        // Try multiple slug patterns that Polymarket uses for 15-min markets
+        for pattern in ["updown", "15-min", "15min", "up-down"] {
             match self.fetch_markets(pattern).await {
                 Ok(markets) => {
                     for market in markets {
+                        // Skip if already seen (dedup by condition_id)
+                        if seen_ids.contains(&market.condition_id) {
+                            continue;
+                        }
+
                         let q = market.question.to_lowercase();
-                        if (q.contains("btc") || q.contains("eth") || q.contains("sol"))
-                            && (q.contains("up") || q.contains("down"))
-                        {
+                        let slug = market.slug.to_lowercase();
+
+                        // Must be a crypto market (BTC/ETH/SOL)
+                        let is_crypto = q.contains("btc") || q.contains("bitcoin")
+                            || q.contains("eth") || q.contains("ethereum")
+                            || q.contains("sol") || q.contains("solana");
+
+                        // Must be an up/down market
+                        let is_updown = q.contains("up") || q.contains("down")
+                            || slug.contains("updown") || slug.contains("up-down");
+
+                        // Must be 15-min (check question or slug)
+                        let is_15min = q.contains("15") || slug.contains("15")
+                            || q.contains("fifteen") || q.contains("minute");
+
+                        // Must have valid clobTokenIds
+                        let has_valid_tokens = market.clob_token_ids.len() >= 2
+                            || market.tokens.len() >= 2;
+
+                        if is_crypto && is_updown && is_15min && has_valid_tokens && market.accepting_orders {
+                            info!(
+                                "Found 15-min market: {} (tokens: {:?})",
+                                market.slug,
+                                market.clob_token_ids
+                            );
+                            seen_ids.insert(market.condition_id.clone());
                             all_markets.push(market);
                         }
                     }
@@ -332,6 +378,7 @@ impl PolymarketClient {
             }
         }
 
+        info!("Total 15-min crypto markets found: {}", all_markets.len());
         Ok(all_markets)
     }
 

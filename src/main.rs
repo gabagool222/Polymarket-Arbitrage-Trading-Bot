@@ -191,14 +191,29 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
     } else {
         info!("Found {} active markets:", markets.len());
         for market in &markets {
-            info!("  - {} ({})", market.question, market.condition_id);
+            info!(
+                "  - {} | condition_id: {} | clobTokenIds: {:?}",
+                market.question,
+                market.condition_id,
+                market.clob_token_ids
+            );
         }
     }
 
+    // FIX: Update trading engine's market cache with real clobTokenIds
+    trading_engine.update_market_cache(markets.clone()).await;
+
     // Collect token IDs for WebSocket subscriptions
+    // FIX: Use clobTokenIds instead of tokens array for accurate IDs
     let token_ids: Vec<String> = markets
         .iter()
-        .flat_map(|m| m.tokens.iter().map(|t| t.token_id.clone()))
+        .flat_map(|m| {
+            if !m.clob_token_ids.is_empty() {
+                m.clob_token_ids.clone()
+            } else {
+                m.tokens.iter().map(|t| t.token_id.clone()).collect()
+            }
+        })
         .collect();
 
     // Spawn Polymarket WebSocket task

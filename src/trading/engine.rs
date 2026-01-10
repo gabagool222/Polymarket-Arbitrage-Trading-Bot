@@ -25,6 +25,8 @@ pub struct TradingEngine {
     daily_stats: Arc<RwLock<DailyStats>>,
     signal_tx: mpsc::Sender<Signal>,
     signal_rx: mpsc::Receiver<Signal>,
+    /// Cached markets data with real clobTokenIds
+    cached_markets: Arc<RwLock<HashMap<String, Market>>>,
 }
 
 impl TradingEngine {
@@ -42,7 +44,29 @@ impl TradingEngine {
             daily_stats: Arc::new(RwLock::new(DailyStats::default())),
             signal_tx,
             signal_rx,
+            cached_markets: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Update cached markets with fresh data from API
+    pub async fn update_market_cache(&self, markets: Vec<Market>) {
+        let mut cache = self.cached_markets.write().await;
+        cache.clear();
+
+        for market in markets {
+            info!(
+                "Caching market: {} with token IDs: {:?}",
+                market.slug, market.clob_token_ids
+            );
+            cache.insert(market.condition_id.clone(), market);
+        }
+
+        info!("Market cache updated with {} markets", cache.len());
+    }
+
+    /// Get cached market by condition_id
+    pub async fn get_cached_market(&self, condition_id: &str) -> Option<Market> {
+        self.cached_markets.read().await.get(condition_id).cloned()
     }
 
     /// Process market price update
@@ -308,6 +332,7 @@ impl TradingEngine {
     }
 
     /// Check active trades for completion or timeout
+    /// FIX: Added fill detection for Leg1 to trigger Leg2 placement
     async fn check_active_trades(&self, prices: &MarketPrices) -> Result<()> {
         let mut trades = self.active_trades.write().await;
         let now = Utc::now();
@@ -335,6 +360,23 @@ impl TradingEngine {
                         if let Some(ref order_id) = leg2.order_id {
                             let _ = self.client.cancel_order(order_id).await;
                         }
+                    }
+                    continue;
+                }
+
+                // FIX: Check if Leg1 is filled (for pending Leg1 trades)
+                if trade.status == HedgeStatus::Leg1Pending {
+                    let leg1_filled = self.check_leg_fill_status(trade, true).await;
+
+                    if leg1_filled {
+                        trade.leg1.status = LegStatus::Filled;
+                        trade.leg1.filled_size = trade.leg1.size;
+                        trade.leg1.filled_at = Some(now);
+                        trade.status = HedgeStatus::Leg1Filled;
+                        info!(
+                            "Trade {} Leg1 FILLED: {} {} @ {}",
+                            trade_id, trade.leg1.token_type, trade.leg1.filled_size, trade.leg1.price
+                        );
                     }
                 }
 
@@ -372,10 +414,106 @@ impl TradingEngine {
                         }
                     }
                 }
+
+                // FIX: Check if Leg2 is filled (for pending Leg2 trades)
+                if trade.status == HedgeStatus::Leg2Pending && trade.leg2.is_some() {
+                    let leg2_filled = self.check_leg_fill_status(trade, false).await;
+
+                    if leg2_filled {
+                        if let Some(ref mut leg2) = trade.leg2 {
+                            leg2.status = LegStatus::Filled;
+                            leg2.filled_size = leg2.size;
+                            leg2.filled_at = Some(now);
+                        }
+                        trade.status = HedgeStatus::Complete;
+                        trade.closed_at = Some(now);
+
+                        // Calculate PNL: guaranteed $1 payout - (leg1 cost + leg2 cost)
+                        let leg1_cost = trade.leg1.price * trade.leg1.filled_size;
+                        let leg2_cost = trade.leg2.as_ref()
+                            .map(|l| l.price * l.filled_size)
+                            .unwrap_or(Decimal::ZERO);
+                        let total_cost = leg1_cost + leg2_cost;
+                        let payout = trade.leg1.filled_size.min(
+                            trade.leg2.as_ref().map(|l| l.filled_size).unwrap_or(Decimal::ZERO)
+                        );
+                        let pnl = payout - total_cost;
+                        trade.pnl = Some(pnl);
+
+                        info!(
+                            "🎉 Trade {} COMPLETE! Leg2 filled. PNL: ${:.4} (cost: ${:.4}, payout: ${:.4})",
+                            trade_id, pnl, total_cost, payout
+                        );
+                    }
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Check if a leg's order has been filled
+    /// FIX: This function checks fill status via API or simulates fill in test mode
+    async fn check_leg_fill_status(&self, trade: &HedgeTrade, is_leg1: bool) -> bool {
+        let leg = if is_leg1 { &trade.leg1 } else {
+            match &trade.leg2 {
+                Some(l) => l,
+                None => return false,
+            }
+        };
+
+        // Skip if already filled
+        if leg.status == LegStatus::Filled {
+            return true;
+        }
+
+        // In test mode, simulate fill after a short delay
+        // (in reality we'd check if price crossed our limit)
+        if trade.is_simulated {
+            // Simulate: assume fill after 2 seconds for testing
+            let time_since_created = Utc::now() - trade.created_at;
+            if time_since_created.num_seconds() >= 2 {
+                info!(
+                    "[SIMULATION] Simulating {} fill for trade {}",
+                    if is_leg1 { "Leg1" } else { "Leg2" },
+                    trade.id
+                );
+                return true;
+            }
+            return false;
+        }
+
+        // Real mode: check fills via API
+        if let Some(ref order_id) = leg.order_id {
+            match self.client.get_fills(Some(&trade.market_id)).await {
+                Ok(fills) => {
+                    // Check if any fill matches our order
+                    let total_filled: Decimal = fills
+                        .iter()
+                        .filter(|f| f.order_id == *order_id)
+                        .map(|f| f.size)
+                        .sum();
+
+                    if total_filled >= leg.size {
+                        info!(
+                            "Order {} fully filled: {} / {}",
+                            order_id, total_filled, leg.size
+                        );
+                        return true;
+                    } else if total_filled > Decimal::ZERO {
+                        debug!(
+                            "Order {} partially filled: {} / {}",
+                            order_id, total_filled, leg.size
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to fetch fills for order {}: {}", order_id, e);
+                }
+            }
+        }
+
+        false
     }
 
     /// Calculate Leg 2 parameters
@@ -409,10 +547,49 @@ impl TradingEngine {
     }
 
     /// Get token ID for a market and outcome
+    /// FIX: Now uses real clobTokenIds from cached market data
     async fn get_token_id(&self, market_id: &str, token_type: TokenType) -> Result<String> {
-        // In a real implementation, we'd cache market data
-        // For now, return a placeholder based on convention
-        Ok(format!("{}_{}", market_id, token_type.to_string().to_lowercase()))
+        let cache = self.cached_markets.read().await;
+
+        if let Some(market) = cache.get(market_id) {
+            // clobTokenIds: index 0 = Yes/Up, index 1 = No/Down
+            let token_id = match token_type {
+                TokenType::Yes => market.clob_token_ids.get(0),
+                TokenType::No => market.clob_token_ids.get(1),
+            };
+
+            if let Some(id) = token_id {
+                debug!("Got token_id for {} {:?}: {}", market_id, token_type, id);
+                return Ok(id.clone());
+            }
+
+            // Fallback to tokens array if clobTokenIds not available
+            let token = market.tokens.iter().find(|t| {
+                let outcome = t.outcome.to_lowercase();
+                match token_type {
+                    TokenType::Yes => outcome == "yes" || outcome == "up",
+                    TokenType::No => outcome == "no" || outcome == "down",
+                }
+            });
+
+            if let Some(t) = token {
+                debug!("Got token_id from tokens array for {} {:?}: {}", market_id, token_type, t.token_id);
+                return Ok(t.token_id.clone());
+            }
+
+            anyhow::bail!(
+                "Token {} not found in market {}. Available: {:?}",
+                token_type,
+                market_id,
+                market.clob_token_ids
+            );
+        }
+
+        anyhow::bail!(
+            "Market {} not in cache. Call update_market_cache() first. Cache has {} markets.",
+            market_id,
+            cache.len()
+        );
     }
 
     /// Extract asset name from market ID
