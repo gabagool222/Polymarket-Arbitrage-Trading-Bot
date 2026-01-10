@@ -1,27 +1,31 @@
 # PolyRustArb Bot - Multi-stage Dockerfile for Coolify deployment
 # Build stage
-FROM rust:1.75-slim-bookworm AS builder
+FROM rust:bookworm AS builder
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies needed by ethers/ring/secp256k1 crates
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    build-essential \
+    cmake \
+    perl \
+    git \
+    clang \
+    llvm \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests first for better caching
+# Copy manifests and source code
 COPY Cargo.toml Cargo.lock* ./
-
-# Create dummy src to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release && rm -rf src
-
-# Copy actual source code
 COPY src ./src
 
-# Build the actual binary
-RUN touch src/main.rs && cargo build --release
+# Build the release binary
+# Build the release binary
+ENV RUST_BACKTRACE=1
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN cargo build --release
 
 # Runtime stage
 FROM debian:bookworm-slim

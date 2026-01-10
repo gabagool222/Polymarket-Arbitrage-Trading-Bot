@@ -159,7 +159,7 @@ impl Default for BinanceConfig {
                 "solusdt".to_string(),
             ],
             move_window_sec: 5,
-            ws_url: "wss://stream.binance.com:9443/ws".to_string(),
+            ws_url: "wss://stream.binance.com:9443".to_string(),
             reconnect_delay_ms: 1000,
             max_reconnect_attempts: 10,
         }

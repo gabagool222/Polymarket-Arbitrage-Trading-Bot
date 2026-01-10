@@ -60,6 +60,7 @@ impl HedgingStrategy {
             signal_type: SignalType::HedgeEntry,
             market_id: prices.condition_id.clone(),
             token_type,
+            token_id: Some(token_id.clone()),
             suggested_price: price,
             suggested_size: size,
             confidence: edge / threshold, // Higher edge = higher confidence
@@ -107,6 +108,7 @@ impl HedgingStrategy {
         &self,
         position: &Position,
         current_price: Decimal,
+        token_id: &str,
     ) -> Option<Signal> {
         let dump_trigger = self.config.trading.dump_trigger_pct;
 
@@ -139,6 +141,7 @@ impl HedgingStrategy {
                 signal_type: SignalType::AverageDown,
                 market_id: position.market_id.clone(),
                 token_type,
+                token_id: Some(token_id.to_string()),
                 suggested_price: current_price,
                 suggested_size: self.config.trading.per_trade_shares,
                 confidence: (drop_pct / dump_trigger).min(Decimal::ONE),
@@ -227,6 +230,7 @@ impl LatencyStrategy {
             signal_type: SignalType::LatencyEntry,
             market_id: market_id.to_string(),
             token_type: expected_winner,
+            token_id: Some(token_id.clone()),
             suggested_price: current_price + Decimal::new(1, 2), // Bid 1 cent above market
             suggested_size: size,
             confidence: (edge / Decimal::new(10, 2)).min(Decimal::ONE),
@@ -288,13 +292,13 @@ impl StrategyManager {
 
         // Check averaging down if we have a position
         if let Some(pos) = position {
-            let current_price = if pos.yes_shares > pos.no_shares {
-                market_prices.yes_price
+            let (current_price, token_id) = if pos.yes_shares > pos.no_shares {
+                (market_prices.yes_price, &market_prices.yes_token_id)
             } else {
-                market_prices.no_price
+                (market_prices.no_price, &market_prices.no_token_id)
             };
 
-            if let Some(mut signal) = self.hedging.should_average_down(pos, current_price) {
+            if let Some(mut signal) = self.hedging.should_average_down(pos, current_price, token_id) {
                 if self.config.maker_rebates.enabled {
                     signal = self.apply_rebate_boost(signal);
                 }

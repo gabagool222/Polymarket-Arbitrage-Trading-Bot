@@ -184,9 +184,17 @@ impl TradingEngine {
     async fn open_trade(&self, signal: Signal) -> Result<()> {
         let is_simulated = self.config.is_test_mode();
 
+        // Resolve token ID from signal or fallback
+        let token_id = if let Some(id) = &signal.token_id {
+            id.clone()
+        } else {
+            warn!("Signal missing token_id, using fallback");
+            self.get_token_id(&signal.market_id, signal.token_type).await?
+        };
+
         // Create order request
         let order = OrderRequest {
-            token_id: self.get_token_id(&signal.market_id, signal.token_type).await?,
+            token_id,
             side: Side::Buy,
             price: signal.suggested_price,
             size: signal.suggested_size,
@@ -254,8 +262,15 @@ impl TradingEngine {
 
     /// Average down on existing position
     async fn average_down(&self, signal: Signal) -> Result<()> {
+        // Resolve token ID
+        let token_id = if let Some(id) = &signal.token_id {
+            id.clone()
+        } else {
+            self.get_token_id(&signal.market_id, signal.token_type).await?
+        };
+
         let order = OrderRequest {
-            token_id: self.get_token_id(&signal.market_id, signal.token_type).await?,
+            token_id,
             side: Side::Buy,
             price: signal.suggested_price,
             size: signal.suggested_size,

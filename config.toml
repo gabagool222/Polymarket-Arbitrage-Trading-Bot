@@ -23,12 +23,9 @@ chain_id = 137
 
 [trading]
 # Market IDs to monitor (15-min BTC/ETH/SOL Up/Down markets)
-# These are placeholder slugs - actual condition_ids fetched dynamically
-market_slugs = [
-    "will-btc-go-up-15-min",
-    "will-eth-go-up-15-min",
-    "will-sol-go-up-15-min"
-]
+# NOTE: The bot uses DYNAMIC DISCOVERY from Gamma API based on '15-min' pattern.
+# The list below is IGNORED/DEPRECATED but kept for reference structure.
+market_slugs = [] # Auto-filled by bot logic
 
 # Shares per trade (configurable: $1 = ~2 shares at $0.50, $100 = ~200 shares)
 # $5 trade = 10 shares @ $0.50 price
@@ -75,7 +72,7 @@ symbols = ["btcusdt", "ethusdt", "solusdt"]
 move_window_sec = 5
 
 # Binance WebSocket URL (public, no API key needed)
-ws_url = "wss://stream.binance.com:9443/ws"
+ws_url = "wss://stream.binance.com:9443"
 
 # Reconnect settings
 reconnect_delay_ms = 1000

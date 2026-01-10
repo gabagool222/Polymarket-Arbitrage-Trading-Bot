@@ -31,7 +31,7 @@ use clap::Parser;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::binance::{run_binance_ws, BinanceTick, PriceMove};
 use crate::config::{AppConfig, OperatingMode};
@@ -183,48 +183,33 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
 
     info!("Fetching available 15-min crypto markets...");
 
-    // Fetch markets
-    let markets = client.fetch_15min_crypto_markets().await?;
+    // Fetch markets (active 15-min crypto binary)
+    let mut markets = client.fetch_active_crypto_markets().await?;
 
     if markets.is_empty() {
         warn!("No active 15-min crypto markets found. Will retry...");
     } else {
-        info!("Found {} active markets:", markets.len());
+        info!("Found {} active crypto markets:", markets.len());
         for market in &markets {
-            info!(
-                "  - {} | condition_id: {} | clobTokenIds: {:?}",
-                market.question,
-                market.condition_id,
-                market.clob_token_ids
-            );
+            info!("  - {} ({}) [{}]", market.title, market.condition_id, market.asset);
         }
     }
 
-    // FIX: Update trading engine's market cache with real clobTokenIds
-    trading_engine.update_market_cache(markets.clone()).await;
-
     // Collect token IDs for WebSocket subscriptions
-    // FIX: Use clobTokenIds instead of tokens array for accurate IDs
-    let token_ids: Vec<String> = markets
-        .iter()
-        .flat_map(|m| {
-            if !m.clob_token_ids.is_empty() {
-                m.clob_token_ids.clone()
-            } else {
-                m.tokens.iter().map(|t| t.token_id.clone()).collect()
-            }
-        })
-        .collect();
+    let mut current_token_ids = PolymarketClient::get_all_token_ids(&markets);
 
     // Spawn Polymarket WebSocket task
     let poly_config = Arc::clone(&config);
-    let poly_tokens = token_ids.clone();
-    tokio::spawn(async move {
+    let poly_tokens = current_token_ids.clone();
+    let poly_price_tx_clone = poly_price_tx.clone();
+    let poly_book_tx_clone = poly_book_tx.clone();
+    
+    let mut poly_ws_handle = tokio::spawn(async move {
         if let Err(e) = run_polymarket_ws(
             poly_config,
             poly_tokens,
-            poly_price_tx,
-            poly_book_tx,
+            poly_price_tx_clone,
+            poly_book_tx_clone,
         )
         .await
         {
@@ -253,17 +238,65 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
     // Main event loop
     let mut last_binance_move: Option<PriceMove> = None;
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    // Refresh markets every 5 minutes (300 seconds)
+    let mut refresh_interval = tokio::time::interval(std::time::Duration::from_secs(300));
 
     loop {
         tokio::select! {
+            // Market Refresh Task
+            _ = refresh_interval.tick() => {
+                info!("Refreshing 15-min crypto markets...");
+                match client.fetch_active_crypto_markets().await {
+                    Ok(new_markets) => {
+                        let new_token_ids = PolymarketClient::get_all_token_ids(&new_markets);
+                        
+                        // Check if subscription needs update
+                        if new_token_ids != current_token_ids && !new_token_ids.is_empty() {
+                            info!("Market change detected. Updating WebSocket subscription...");
+                            info!("Old markets: {}, New markets: {}", markets.len(), new_markets.len());
+                            
+                            // Abort old WS task
+                            poly_ws_handle.abort();
+                            
+                            // Spawn new WS task
+                            let poly_config = Arc::clone(&config);
+                            let poly_tokens = new_token_ids.clone();
+                            let poly_price_tx_clone = poly_price_tx.clone();
+                            let poly_book_tx_clone = poly_book_tx.clone();
+                            
+                            poly_ws_handle = tokio::spawn(async move {
+                                if let Err(e) = run_polymarket_ws(
+                                    poly_config,
+                                    poly_tokens,
+                                    poly_price_tx_clone,
+                                    poly_book_tx_clone,
+                                )
+                                .await
+                                {
+                                    error!("Polymarket WebSocket error: {}", e);
+                                }
+                            });
+                            
+                            // Update state
+                            markets = new_markets;
+                            current_token_ids = new_token_ids;
+                        } else {
+                            debug!("No market changes detected.");
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to refresh markets: {}", e);
+                    }
+                }
+            }
             // Handle Polymarket price updates
             Ok(update) = poly_price_rx.recv() => {
                 // Find the market for this token
                 if let Some(market) = markets.iter().find(|m|
-                    m.tokens.iter().any(|t| t.token_id == update.token_id)
+                    m.yes_token_id == update.token_id || m.no_token_id == update.token_id
                 ) {
-                    // Fetch full market prices
-                    match client.fetch_market_prices(market).await {
+                    // Fetch full market prices using crypto specific function
+                    match client.fetch_crypto_market_prices(market).await {
                         Ok(prices) => {
                             // Process with trading engine
                             if let Err(e) = trading_engine.on_market_update(

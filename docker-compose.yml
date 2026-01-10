@@ -32,15 +32,7 @@ services:
     # ports:
     #   - "8080:8080"
 
-    # Resource limits
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 512M
-        reservations:
-          cpus: '0.25'
-          memory: 128M
+
 
     logging:
       driver: "json-file"

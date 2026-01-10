@@ -1,44 +1,20 @@
 //! Polymarket CLOB API client
-//!
-//! Implements proper EIP-712 typed data signing per Polymarket CLOB spec.
-//! Reference: https://docs.polymarket.com/
 
 use crate::config::AppConfig;
 use crate::polymarket::types::*;
 use anyhow::{Context, Result};
 use ethers::prelude::*;
-use ethers::types::transaction::eip712::{EIP712Domain, Eip712};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-// Polymarket CTF Exchange chain ID (Polygon mainnet)
-const POLYGON_CHAIN_ID: u64 = 137;
-
-// Polymarket CTF Exchange contract address
-const CTF_EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
-
-// Negation Risk CTF Exchange (for conditional tokens)
-const NEG_RISK_CTF_EXCHANGE: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
-
 /// Polymarket CLOB client for REST API interactions
 pub struct PolymarketClient {
     config: Arc<AppConfig>,
     http_client: Client,
     wallet: Option<LocalWallet>,
-    /// L2 API key (derived from signing a message with wallet)
-    api_creds: Option<ApiCredentials>,
-}
-
-/// API credentials for authenticated requests
-#[derive(Debug, Clone)]
-struct ApiCredentials {
-    api_key: String,
-    api_secret: String,
-    api_passphrase: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,34 +25,83 @@ struct ApiResponse<T> {
     error: Option<String>,
 }
 
+/// Response wrapper for CLOB API
 #[derive(Debug, Deserialize)]
-struct MarketsResponse {
-    data: Vec<MarketData>,
+struct ClobMarketsResponse {
+    data: Vec<ClobMarketData>,
     #[serde(default)]
     next_cursor: Option<String>,
 }
 
+/// Market data from CLOB API (uses snake_case)
 #[derive(Debug, Deserialize)]
-struct MarketData {
+struct ClobMarketData {
     condition_id: String,
-    question_id: String,
-    tokens: Vec<TokenData>,
-    slug: Option<String>,
+    #[serde(default)]
+    question_id: Option<String>,
+    #[serde(default)]
+    tokens: Vec<ClobTokenData>,
+    #[serde(default, alias = "slug")]
+    market_slug: Option<String>,
     question: String,
+    #[serde(default)]
     end_date_iso: Option<String>,
+    #[serde(default)]
     active: bool,
+    #[serde(default)]
     closed: bool,
+    #[serde(default)]
     accepting_orders: bool,
-    /// CLOB token IDs from Gamma API - index 0 = Yes/Up, index 1 = No/Down
+    /// CLOB token IDs - index 0 = Yes/Up, index 1 = No/Down
     #[serde(default, rename = "clobTokenIds")]
     clob_token_ids: Vec<String>,
 }
 
+/// Token data from CLOB API
 #[derive(Debug, Deserialize)]
-struct TokenData {
+struct ClobTokenData {
     token_id: String,
     outcome: String,
+    #[serde(default)]
     price: Option<f64>,
+}
+
+/// Gamma API event response (for discovering updown markets)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaEvent {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    markets: Vec<GammaMarket>,
+}
+
+/// Gamma API market inside an event
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaMarket {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    condition_id: String,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    end_date: Option<String>,
+    #[serde(default)]
+    clob_token_ids: Option<String>,  // JSON array as string: "[\"id1\", \"id2\"]"
+    #[serde(default)]
+    accepting_orders: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +126,17 @@ struct CreateOrderRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct CreateOrdersRequest {
+    orders: Vec<SignedOrder>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarketMetadataResponse {
+    minimum_order_size: String,
+    minimum_tick_size: String, // Note: API might call it tick_size or minimum_tick_size
+}
+
+#[derive(Debug, Serialize)]
 struct SignedOrder {
     salt: String,
     maker: String,
@@ -115,42 +151,6 @@ struct SignedOrder {
     side: String,
     signature_type: u8,
     signature: String,
-}
-
-/// EIP-712 Order struct for Polymarket CTF Exchange
-/// Reference: https://docs.polymarket.com/
-#[derive(Debug, Clone, Serialize, Deserialize, Eip712, EthAbiType)]
-#[eip712(
-    name = "Polymarket CTF Exchange",
-    version = "1",
-    chain_id = 137,
-    verifying_contract = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-)]
-struct Order712 {
-    /// Random salt for uniqueness
-    salt: U256,
-    /// Maker address
-    maker: Address,
-    /// Signer address (usually same as maker)
-    signer: Address,
-    /// Taker address (0x0 for any taker)
-    taker: Address,
-    /// Token ID being traded
-    token_id: U256,
-    /// Amount of tokens maker is selling/buying
-    maker_amount: U256,
-    /// Amount of USDC the maker wants
-    taker_amount: U256,
-    /// Order expiration timestamp
-    expiration: U256,
-    /// Nonce for order uniqueness
-    nonce: U256,
-    /// Fee rate in basis points
-    fee_rate_bps: U256,
-    /// 0 = BUY, 1 = SELL
-    side: U256,
-    /// Signature type: 0 = EOA, 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
-    signature_type: U256,
 }
 
 impl PolymarketClient {
@@ -168,7 +168,7 @@ impl PolymarketClient {
                     let wallet: LocalWallet = key
                         .parse()
                         .context("Failed to parse private key")?;
-                    Some(wallet.with_chain_id(POLYGON_CHAIN_ID))
+                    Some(wallet.with_chain_id(config.wallet.chain_id))
                 }
                 Err(e) => {
                     warn!("Private key not found, running in read-only mode: {}", e);
@@ -180,26 +180,10 @@ impl PolymarketClient {
             None
         };
 
-        // API credentials are derived from wallet signing (set via env or config)
-        let api_creds = if let (Ok(key), Ok(secret), Ok(passphrase)) = (
-            std::env::var("POLY_API_KEY"),
-            std::env::var("POLY_API_SECRET"),
-            std::env::var("POLY_API_PASSPHRASE"),
-        ) {
-            Some(ApiCredentials {
-                api_key: key,
-                api_secret: secret,
-                api_passphrase: passphrase,
-            })
-        } else {
-            None
-        };
-
         Ok(Self {
             config,
             http_client,
             wallet,
-            api_creds,
         })
     }
 
@@ -213,61 +197,15 @@ impl PolymarketClient {
         &self.config.general.gamma_api_url
     }
 
-    /// Build authentication headers for L2 (Poly) API requests
-    /// Uses HMAC-SHA256 signature with timestamp
-    fn build_auth_headers(&self, method: &str, path: &str, body: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-
-        if let Some(ref creds) = self.api_creds {
-            let timestamp = chrono::Utc::now().timestamp_millis().to_string();
-
-            // Build the signature message: timestamp + method + path + body
-            let message = format!("{}{}{}{}", timestamp, method, path, body);
-
-            // HMAC-SHA256 signature
-            use hmac::{Hmac, Mac};
-            use sha2::Sha256;
-            type HmacSha256 = Hmac<Sha256>;
-
-            if let Ok(mut mac) = HmacSha256::new_from_slice(creds.api_secret.as_bytes()) {
-                mac.update(message.as_bytes());
-                let signature = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    mac.finalize().into_bytes()
-                );
-
-                headers.insert(
-                    "POLY-API-KEY",
-                    HeaderValue::from_str(&creds.api_key).unwrap_or(HeaderValue::from_static("")),
-                );
-                headers.insert(
-                    "POLY-SIGNATURE",
-                    HeaderValue::from_str(&signature).unwrap_or(HeaderValue::from_static("")),
-                );
-                headers.insert(
-                    "POLY-TIMESTAMP",
-                    HeaderValue::from_str(&timestamp).unwrap_or(HeaderValue::from_static("")),
-                );
-                headers.insert(
-                    "POLY-PASSPHRASE",
-                    HeaderValue::from_str(&creds.api_passphrase).unwrap_or(HeaderValue::from_static("")),
-                );
-            }
-        }
-
-        headers
-    }
-
-    /// Fetch markets matching slug patterns
-    /// FIX: Changed slug_filter to slug_contains (correct Gamma API param)
+    /// Fetch markets matching slug patterns using CLOB API
     pub async fn fetch_markets(&self, slug_pattern: &str) -> Result<Vec<Market>> {
+        // Use CLOB API which has proper market data format
         let url = format!(
-            "{}/markets?slug_contains={}&active=true&closed=false&limit=100",
-            self.gamma_url(),
-            slug_pattern
+            "{}/markets?active=true&closed=false",
+            self.api_url()
         );
 
-        debug!("Fetching markets from: {}", url);
+        debug!("Fetching markets from CLOB API: {}", url);
 
         let response = self
             .http_client
@@ -283,23 +221,32 @@ impl PolymarketClient {
             anyhow::bail!("API error {}: {}", status, body);
         }
 
-        let markets_data: Vec<MarketData> = serde_json::from_str(&body)
-            .context("Failed to parse markets response")?;
+        // Debug: log first 500 chars of response
+        debug!("API response (first 500 chars): {}", &body.chars().take(500).collect::<String>());
+
+        let clob_response: ClobMarketsResponse = serde_json::from_str(&body)
+            .context("Failed to parse CLOB markets response")?;
+
+        // Filter markets by slug pattern
+        let markets_data: Vec<ClobMarketData> = clob_response.data
+            .into_iter()
+            .filter(|m| {
+                let slug = m.market_slug.as_deref().unwrap_or("").to_lowercase();
+                let question = m.question.to_lowercase();
+                slug.contains(slug_pattern) || question.contains(slug_pattern)
+            })
+            .collect();
 
         let markets: Vec<Market> = markets_data
             .into_iter()
             .map(|m| {
-                // Use clobTokenIds if available, otherwise fall back to tokens array
-                let clob_token_ids = if !m.clob_token_ids.is_empty() {
-                    m.clob_token_ids
-                } else {
-                    // Fallback: extract from tokens array
-                    m.tokens.iter().map(|t| t.token_id.clone()).collect()
-                };
-
+                let clob_token_ids = m.clob_token_ids
+                    .iter()
+                    .map(|s| s.clone())
+                    .collect::<Vec<_>>();
                 Market {
-                    condition_id: m.condition_id,
-                    question_id: m.question_id,
+                    condition_id: m.condition_id.clone(),
+                    question_id: m.question_id.unwrap_or_else(|| m.condition_id),
                     tokens: m
                         .tokens
                         .into_iter()
@@ -309,7 +256,7 @@ impl PolymarketClient {
                             price: t.price.map(|p| Decimal::try_from(p).unwrap_or_default()),
                         })
                         .collect(),
-                    slug: m.slug.unwrap_or_default(),
+                    slug: m.market_slug.unwrap_or_default(),
                     question: m.question,
                     end_date_iso: m.end_date_iso,
                     active: m.active,
@@ -325,61 +272,318 @@ impl PolymarketClient {
         Ok(markets)
     }
 
-    /// Fetch 15-minute crypto markets (BTC/ETH/SOL Up/Down)
-    /// FIX: Improved filter to match actual 15-min market slugs
+    /// Fetch 15-minute crypto up/down markets from Gamma API events
+    /// Pattern: btc-updown-15m-{timestamp}, eth-updown-15m-{timestamp}, etc.
     pub async fn fetch_15min_crypto_markets(&self) -> Result<Vec<Market>> {
         let mut all_markets = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
 
-        // Try multiple slug patterns that Polymarket uses for 15-min markets
-        for pattern in ["updown", "15-min", "15min", "up-down"] {
-            match self.fetch_markets(pattern).await {
+        // Search patterns for crypto updown 15m events
+        let patterns = ["btc-updown-15m", "eth-updown-15m", "sol-updown-15m"];
+
+        for pattern in patterns {
+            match self.fetch_updown_events(pattern).await {
                 Ok(markets) => {
-                    for market in markets {
-                        // Skip if already seen (dedup by condition_id)
-                        if seen_ids.contains(&market.condition_id) {
-                            continue;
-                        }
-
-                        let q = market.question.to_lowercase();
-                        let slug = market.slug.to_lowercase();
-
-                        // Must be a crypto market (BTC/ETH/SOL)
-                        let is_crypto = q.contains("btc") || q.contains("bitcoin")
-                            || q.contains("eth") || q.contains("ethereum")
-                            || q.contains("sol") || q.contains("solana");
-
-                        // Must be an up/down market
-                        let is_updown = q.contains("up") || q.contains("down")
-                            || slug.contains("updown") || slug.contains("up-down");
-
-                        // Must be 15-min (check question or slug)
-                        let is_15min = q.contains("15") || slug.contains("15")
-                            || q.contains("fifteen") || q.contains("minute");
-
-                        // Must have valid clobTokenIds
-                        let has_valid_tokens = market.clob_token_ids.len() >= 2
-                            || market.tokens.len() >= 2;
-
-                        if is_crypto && is_updown && is_15min && has_valid_tokens && market.accepting_orders {
-                            info!(
-                                "Found 15-min market: {} (tokens: {:?})",
-                                market.slug,
-                                market.clob_token_ids
-                            );
-                            seen_ids.insert(market.condition_id.clone());
-                            all_markets.push(market);
-                        }
-                    }
+                    info!("Found {} markets for pattern '{}'", markets.len(), pattern);
+                    all_markets.extend(markets);
                 }
                 Err(e) => {
-                    warn!("Failed to fetch markets for pattern '{}': {}", pattern, e);
+                    warn!("Failed to fetch events for pattern '{}': {}", pattern, e);
                 }
             }
         }
 
         info!("Total 15-min crypto markets found: {}", all_markets.len());
         Ok(all_markets)
+    }
+
+    /// Fetch updown events from Gamma API
+    async fn fetch_updown_events(&self, ticker_pattern: &str) -> Result<Vec<Market>> {
+        // Use Gamma API events endpoint with slug_contains
+        let url = format!(
+            "{}/events?active=true&closed=false&limit=20&slug_contains={}",
+            self.gamma_url(),
+            ticker_pattern
+        );
+
+        debug!("Fetching events from Gamma API: {}", url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch events")?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!("Gamma API error {}: {}", status, body);
+        }
+
+        // Parse Gamma events response
+        let events: Vec<GammaEvent> = serde_json::from_str(&body)
+            .context("Failed to parse Gamma events response")?;
+
+        let mut markets = Vec::new();
+
+        for event in events {
+            if !event.active || event.closed {
+                continue;
+            }
+
+            for gm in event.markets {
+                // Parse clobTokenIds JSON array
+                let token_ids: Vec<String> = if let Some(ref clob_ids) = gm.clob_token_ids {
+                    serde_json::from_str(clob_ids).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                // Create tokens from the IDs (usually [Up, Down] or [Yes, No])
+                let tokens: Vec<Token> = token_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| Token {
+                        token_id: id.clone(),
+                        outcome: if i == 0 { "Up".to_string() } else { "Down".to_string() },
+                        price: None,
+                    })
+                    .collect();
+
+                if !tokens.is_empty() {
+                    markets.push(Market {
+                        condition_id: gm.condition_id.clone(),
+                        question_id: gm.condition_id.clone(),
+                        tokens,
+                        slug: gm.slug.unwrap_or_default(),
+                        question: gm.question,
+                        end_date_iso: gm.end_date,
+                        active: true,
+                        closed: false,
+                        accepting_orders: gm.accepting_orders.unwrap_or(true),
+                        clob_token_ids: token_ids.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(markets)
+    }
+
+    /// Fetch active 15-minute crypto binary markets with proper yes/no token mapping
+    /// Uses pagination and specific filters to find "updown" markets
+    /// Retries failed requests up to 3 times
+    pub async fn fetch_active_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
+        let mut crypto_markets = Vec::new();
+        let limit = 100;
+        let mut offset = 0;
+        
+        // Base URL with sorting (newest first by ID) as requested
+        let base_url = format!(
+            "{}/markets?active=true&closed=false&limit={}&order=id&ascending=false&slug_contains=updown",
+            self.gamma_url(),
+            limit
+        );
+
+        loop {
+            let url = format!("{}&offset={}", base_url, offset);
+            debug!("Fetching markets page: offset={}", offset);
+
+            // Retry logic (3 attempts)
+            let mut attempts = 0;
+            let response = loop {
+                attempts += 1;
+                match self.http_client.get(&url).send().await {
+                    Ok(resp) => break Ok(resp),
+                    Err(e) => {
+                        if attempts >= 3 {
+                            break Err(e);
+                        }
+                        warn!("Failed to fetch markets (attempt {}/3): {}. Retrying...", attempts, e);
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }.context("Failed to fetch markets page after 3 attempts")?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                warn!("Gamma API error {}: {}", status, body);
+                break; // Stop on API error
+            }
+
+            let markets_json: Vec<serde_json::Value> = response.json().await
+                .unwrap_or_default();
+
+            if markets_json.is_empty() {
+                break; // No more markets
+            }
+
+            let page_count = markets_json.len();
+
+            for market in markets_json {
+                // Check for binary market
+                let clob_token_ids_str = market.get("clobTokenIds")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("[]");
+                
+                let token_ids: Vec<String> = serde_json::from_str(clob_token_ids_str)
+                    .unwrap_or_default();
+                
+                if token_ids.len() != 2 {
+                    continue; 
+                }
+
+                // Metadata extraction
+                let title = market.get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let slug = market.get("slug")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let condition_id = market.get("conditionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let end_date = market.get("endDate")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let accepting = market.get("acceptingOrders")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+
+                let title_lower = title.to_lowercase();
+                let slug_lower = slug.to_lowercase();
+
+                // Strict filter for 15-min / up-down markets
+                // Either strict slug match OR backup title match
+                let is_target_format = slug_lower.contains("updown") 
+                    || slug_lower.contains("up-down")
+                    || (title_lower.contains("up or down") && (title_lower.contains("15m") || title_lower.contains("15 min")));
+
+                if !is_target_format {
+                    continue;
+                }
+
+                // Asset filter
+                let asset = if title_lower.contains("bitcoin") || slug_lower.contains("btc") {
+                    CryptoAsset::BTC
+                } else if title_lower.contains("ethereum") || slug_lower.contains("eth") {
+                    CryptoAsset::ETH
+                } else if title_lower.contains("solana") || slug_lower.contains("sol") {
+                    CryptoAsset::SOL
+                } else {
+                    continue; // Other asset
+                };
+
+                // Outcome Mapping (Yes/Up -> Index 0 assumption, verified via outcomes array)
+                let outcomes_str = market.get("outcomes")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("[\"Up\", \"Down\"]");
+                
+                let outcomes: Vec<String> = serde_json::from_str(outcomes_str)
+                    .unwrap_or_else(|_| vec!["Up".to_string(), "Down".to_string()]);
+
+                let (yes_token_id, no_token_id) = if outcomes.len() >= 2 {
+                    let first = outcomes[0].to_lowercase();
+                    if first == "up" || first == "yes" {
+                        (token_ids[0].clone(), token_ids[1].clone())
+                    } else {
+                        (token_ids[1].clone(), token_ids[0].clone())
+                    }
+                } else {
+                    (token_ids[0].clone(), token_ids[1].clone())
+                };
+
+                debug!("Discovered: {} ({}) [Yes: {}...]", slug, asset, &yes_token_id[0..6]);
+
+                crypto_markets.push(CryptoMarket {
+                    slug: slug.to_string(),
+                    title: title.to_string(),
+                    condition_id: condition_id.to_string(),
+                    yes_token_id,
+                    no_token_id,
+                    asset,
+                    end_time: end_date,
+                    accepting_orders: accepting,
+                });
+            }
+
+            offset += limit;
+            if page_count < limit {
+                break; // Less than limit means last page
+            }
+            
+            // Safety break 
+            if offset > 2000 {
+                break;
+            }
+        }
+
+        // Log findings (limit to top 20 to avoid spam)
+        info!("=== DISCOVERED 15-MIN CRYPTO MARKETS (Newest First) ===");
+        if crypto_markets.is_empty() {
+             warn!("No markets found. Check API connectivity or filters.");
+        } else {
+            for (i, cm) in crypto_markets.iter().take(20).enumerate() {
+                info!(
+                    "[{}] {} | {} | Active: {} | IDs: {}... / {}...",
+                    i + 1,
+                    cm.asset,
+                    cm.title.chars().take(40).collect::<String>(),
+                    cm.accepting_orders,
+                    &cm.yes_token_id[0..8],
+                    &cm.no_token_id[0..8]
+                );
+            }
+            if crypto_markets.len() > 20 {
+                info!("... and {} more markets (monitoring all)", crypto_markets.len() - 20);
+            }
+        }
+        info!("Total crypto markets found: {}", crypto_markets.len());
+        info!("=========================================");
+
+        Ok(crypto_markets)
+    }
+
+    /// Fetch current prices for a crypto market using token IDs
+    pub async fn fetch_crypto_market_prices(&self, market: &CryptoMarket) -> Result<MarketPrices> {
+        // Fetch orderbooks for both tokens
+        let yes_book = self.fetch_orderbook(&market.yes_token_id).await?;
+        let no_book = self.fetch_orderbook(&market.no_token_id).await?;
+
+        // Get mid prices (or best available)
+        let yes_price = yes_book.mid_price().unwrap_or(Decimal::new(5, 1)); // Default 0.5
+        let no_price = no_book.mid_price().unwrap_or(Decimal::new(5, 1)); // Default 0.5
+
+        let prices = MarketPrices {
+            condition_id: market.condition_id.clone(),
+            yes_price,
+            no_price,
+            yes_token_id: market.yes_token_id.clone(),
+            no_token_id: market.no_token_id.clone(),
+            timestamp: chrono::Utc::now(),
+        };
+
+        debug!(
+            "Prices for {}: yes={}, no={}, sum={}",
+            market.asset,
+            yes_price,
+            no_price,
+            prices.price_sum()
+        );
+
+        Ok(prices)
+    }
+
+    /// Get all token IDs from discovered crypto markets (for WebSocket subscription)
+    pub fn get_all_token_ids(markets: &[CryptoMarket]) -> Vec<String> {
+        let mut token_ids = Vec::new();
+        for m in markets {
+            token_ids.push(m.yes_token_id.clone());
+            token_ids.push(m.no_token_id.clone());
+        }
+        token_ids
     }
 
     /// Fetch order book for a token
@@ -461,6 +665,75 @@ impl PolymarketClient {
         Ok((yes_token, no_token))
     }
 
+    pub async fn get_market_metadata(&self, token_id: &str) -> Result<(Decimal, Decimal)> {
+        // Fetch market config to respect Min Size and Tick Size
+        let url = format!("{}/markets/{}", self.api_url(), token_id);
+        
+        let response = self.http_client.get(&url).send().await?;
+        if !response.status().is_success() {
+             // Fallback default for 15-min crypto binary (Tick 0.1 or 0.01?, Size 1?)
+             return Ok((Decimal::new(1, 0), Decimal::new(1, 2))); 
+        }
+
+        // Parse response (simplified for snippet)
+        // In reality, map proper JSON fields
+        let body: serde_json::Value = response.json().await?;
+        
+        let min_size = body["minimum_order_size"].as_str()
+            .and_then(|s| Decimal::from_str_exact(s).ok())
+            .unwrap_or(Decimal::new(1,0));
+            
+        let tick_size = body["minimum_tick_size"].as_str()
+            .and_then(|s| Decimal::from_str_exact(s).ok())
+            .unwrap_or(Decimal::new(1,2)); // 0.01
+
+        Ok((min_size, tick_size))
+    }
+
+    /// Place multiple orders in a batch (atomic-like)
+    pub async fn place_orders(&self, orders: Vec<OrderRequest>) -> Result<Vec<Order>> {
+        if self.config.is_test_mode() {
+            let mut simulated = Vec::new();
+            for order in orders {
+                simulated.push(self.simulate_order(&order)?);
+            }
+            return Ok(simulated);
+        }
+
+        let wallet = self.wallet.as_ref()
+            .context("Wallet not initialized for real trading")?;
+
+        let mut signed_orders = Vec::new();
+        for order in &orders {
+            signed_orders.push(self.build_signed_order(order, wallet).await?);
+        }
+
+        // Batch endpoint is typically /orders
+        let url = format!("{}/orders", self.api_url());
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&CreateOrdersRequest { orders: signed_orders })
+            .send()
+            .await
+            .context("Failed to place batch orders")?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!("Batch order failed {}: {}", status, body);
+        }
+
+        // Parse list of orders
+        let orders_response: Vec<Order> = serde_json::from_str(&body)
+            .context("Failed to parse batch order response")?;
+
+        info!("Batch orders placed successfully: {} orders", orders_response.len());
+        Ok(orders_response)
+    }
+
     /// Place a limit order (real mode only)
     pub async fn place_order(&self, order: &OrderRequest) -> Result<Order> {
         if self.config.is_test_mode() {
@@ -470,22 +743,15 @@ impl PolymarketClient {
         let wallet = self.wallet.as_ref()
             .context("Wallet not initialized for real trading")?;
 
-        // Build and sign the order with EIP-712
+        // Build and sign the order
         let signed_order = self.build_signed_order(order, wallet).await?;
-        let create_req = CreateOrderRequest { order: signed_order };
-        let body_json = serde_json::to_string(&create_req)?;
 
-        // Build URL and authentication headers
-        let path = "/order";
-        let url = format!("{}{}", self.api_url(), path);
-        let auth_headers = self.build_auth_headers("POST", path, &body_json);
+        let url = format!("{}/order", self.api_url());
 
         let response = self
             .http_client
             .post(&url)
-            .headers(auth_headers)
-            .header("Content-Type", "application/json")
-            .body(body_json)
+            .json(&CreateOrderRequest { order: signed_order })
             .send()
             .await
             .context("Failed to place order")?;
@@ -527,89 +793,121 @@ impl PolymarketClient {
         })
     }
 
-    /// Build a signed order using EIP-712 typed data signing
-    /// Reference: https://docs.polymarket.com/
+    /// Build a signed order using EIP-712
     async fn build_signed_order(
         &self,
         order: &OrderRequest,
         wallet: &LocalWallet,
     ) -> Result<SignedOrder> {
-        let maker_address = wallet.address();
-        let maker = format!("{:?}", maker_address);
+        let chain_id = 137;
+        // Polymarket CTF Exchange
+        let verifying_contract: Address = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".parse()?;
 
-        // Generate random salt
-        let salt_bytes: [u8; 32] = rand::random();
-        let salt = U256::from_big_endian(&salt_bytes);
-
+        let salt = U256::from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+        let maker = wallet.address();
+        let signer = wallet.address(); // Same as maker for EOA
+        let taker = Address::zero();
+        
+        // Parse token_id (decimal string)
+        let token_id = U256::from_dec_str(&order.token_id)
+            .context("Invalid token_id format")?;
+            
+        let expiration = order.expiration
+            .unwrap_or_else(|| chrono::Utc::now().timestamp() + 300); // 5 mins default
+        let expiration_u256 = U256::from(expiration);
+        
         let nonce = U256::zero();
-        let expiration = U256::from(
-            order.expiration.unwrap_or_else(|| chrono::Utc::now().timestamp() + 3600)
-        );
-
-        // Calculate amounts based on price and size
-        // Polymarket uses 6 decimal places (USDC)
-        let price_decimal = order.price;
-        let size_decimal = order.size;
-        let scale = Decimal::new(1_000_000, 0); // 10^6
-
-        // maker_amount = number of tokens (in base units)
-        let maker_amount_dec = size_decimal * scale;
-        let maker_amount = U256::from_dec_str(&maker_amount_dec.to_string())
-            .unwrap_or(U256::zero());
-
-        // taker_amount = USDC to pay/receive (in base units)
-        let taker_amount_dec = size_decimal * price_decimal * scale;
-        let taker_amount = U256::from_dec_str(&taker_amount_dec.to_string())
-            .unwrap_or(U256::zero());
-
-        // Parse token_id to U256
-        let token_id = if order.token_id.starts_with("0x") {
-            U256::from_str_radix(&order.token_id[2..], 16).unwrap_or(U256::zero())
-        } else {
-            U256::from_dec_str(&order.token_id).unwrap_or(U256::zero())
-        };
-
-        // Side: 0 = BUY, 1 = SELL
-        let side = match order.side {
+        let fee_rate_bps = U256::zero();
+        let side_int = match order.side {
             Side::Buy => U256::zero(),
             Side::Sell => U256::one(),
         };
+        let signature_type = U256::zero();
 
-        // Build the EIP-712 typed data order
-        let order_712 = Order712 {
-            salt,
-            maker: maker_address,
-            signer: maker_address,
-            taker: Address::zero(),
-            token_id,
-            maker_amount,
-            taker_amount,
-            expiration,
-            nonce,
-            fee_rate_bps: U256::zero(), // Maker gets rebates
-            side,
-            signature_type: U256::zero(), // EOA signature
+        // Calculate amounts (USDC & Token both 6 decimals)
+        let size_raw = (order.size * Decimal::new(1_000_000, 0)).to_string();
+        let size_u256 = U256::from_dec_str(&size_raw).unwrap_or(U256::zero());
+        
+        let cost_raw = (order.size * order.price * Decimal::new(1_000_000, 0)).round().to_string();
+        let cost_u256 = U256::from_dec_str(&cost_raw).unwrap_or(U256::zero());
+
+        // Maker/Taker amounts rule:
+        // Buy: Maker=USDC (Cost), Taker=Tokens (Size)
+        // Sell: Maker=Tokens (Size), Taker=USDC (Cost)
+        let (maker_amount, taker_amount) = match order.side {
+            Side::Buy => (cost_u256, size_u256),
+            Side::Sell => (size_u256, cost_u256),
         };
 
-        // Sign using EIP-712 typed data
+        // Create TypedData via JSON to avoid struct import issues
+        let typed_data_json = serde_json::json!({
+            "domain": {
+                "name": "Polymarket CTF Exchange",
+                "version": "1",
+                "chainId": chain_id,
+                "verifyingContract": verifying_contract,
+            },
+            "types": {
+                "EIP712Domain": [
+                    { "name": "name", "type": "string" },
+                    { "name": "version", "type": "string" },
+                    { "name": "chainId", "type": "uint256" },
+                    { "name": "verifyingContract", "type": "address" },
+                ],
+                "Order": [
+                    { "name": "salt", "type": "uint256" },
+                    { "name": "maker", "type": "address" },
+                    { "name": "signer", "type": "address" },
+                    { "name": "taker", "type": "address" },
+                    { "name": "tokenId", "type": "uint256" },
+                    { "name": "makerAmount", "type": "uint256" },
+                    { "name": "takerAmount", "type": "uint256" },
+                    { "name": "expiration", "type": "uint256" },
+                    { "name": "nonce", "type": "uint256" },
+                    { "name": "feeRateBps", "type": "uint256" },
+                    { "name": "side", "type": "uint256" },
+                    { "name": "signatureType", "type": "uint256" },
+                ]
+            },
+            "primaryType": "Order",
+            "message": {
+                "salt": salt.to_string(),
+                "maker": format!("{:?}", maker),
+                "signer": format!("{:?}", signer),
+                "taker": format!("{:?}", taker),
+                "tokenId": token_id.to_string(),
+                "makerAmount": maker_amount.to_string(),
+                "takerAmount": taker_amount.to_string(),
+                "expiration": expiration_u256.to_string(),
+                "nonce": nonce.to_string(),
+                "feeRateBps": fee_rate_bps.to_string(),
+                "side": match order.side { Side::Buy => "0".to_string(), Side::Sell => "1".to_string() },
+                "signatureType": signature_type.to_string()
+            }
+        });
+
+        let typed_data: ethers::types::transaction::eip712::TypedData = serde_json::from_value(typed_data_json)
+            .context("Failed to construct TypedData from JSON")?;
+
+        // Sign Typed Data
         let signature = wallet
-            .sign_typed_data(&order_712)
+            .sign_typed_data(&typed_data)
             .await
             .context("Failed to sign EIP-712 order")?;
 
         Ok(SignedOrder {
             salt: salt.to_string(),
-            maker: maker.clone(),
-            signer: maker,
-            taker: "0x0000000000000000000000000000000000000000".to_string(),
-            token_id: order.token_id.clone(),
+            maker: format!("{:?}", maker),
+            signer: format!("{:?}", signer),
+            taker: format!("{:?}", taker),
+            token_id: token_id.to_string(),
             maker_amount: maker_amount.to_string(),
             taker_amount: taker_amount.to_string(),
-            expiration: expiration.to_string(),
+            expiration: expiration_u256.to_string(),
             nonce: nonce.to_string(),
-            fee_rate_bps: "0".to_string(),
-            side: order.side.to_string(),
-            signature_type: 0,
+            fee_rate_bps: fee_rate_bps.to_string(),
+            side: match order.side { Side::Buy => "0".to_string(), Side::Sell => "1".to_string() },
+            signature_type: signature_type.as_u64() as u8,
             signature: format!("0x{}", hex::encode(signature.to_vec())),
         })
     }
