@@ -12,6 +12,7 @@ use sha2::Sha256;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use base64::Engine;
+use hex;
 
 /// Polymarket CLOB client for REST API interactions
 pub struct PolymarketClient {

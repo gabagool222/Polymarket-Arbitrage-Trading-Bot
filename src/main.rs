@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
         println!("🔑 API Keys missing in config. Attempting to auto-derive using Private Key...");
         
         let temp_config = Arc::new(config.clone());
-        match polyarb::polymarket::client::PolymarketClient::new(temp_config) {
+        match PolymarketClient::new(temp_config) {
             Ok(temp_client) => {
                 match temp_client.derive_api_keys().await {
                     Ok(creds) => {
