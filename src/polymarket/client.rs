@@ -1118,7 +1118,6 @@ impl PolymarketClient {
         
         // Polymarket Mainnet Chain ID
         let chain_id = 137;
-        let verifying_contract: Address = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".parse()?;
         let wallet_address = wallet.address();
         
         // Use Checksummed Address (EIP-55)
@@ -1130,15 +1129,20 @@ impl PolymarketClient {
                 "name": "ClobAuthDomain",
                 "version": "1",
                 "chainId": chain_id,
-                "verifyingContract": verifying_contract,
             },
             "types": {
                 "EIP712Domain": [
                     { "name": "name", "type": "string" },
                     { "name": "version", "type": "string" },
                     { "name": "chainId", "type": "uint256" },
-                    { "name": "verifyingContract", "type": "address" },
                 ],
+                "ClobAuth": [
+                    { "name": "address", "type": "address" },
+                    { "name": "timestamp", "type": "string" },
+                    { "name": "nonce", "type": "uint256" },
+                    { "name": "message", "type": "string" },
+                ]
+            },
                 "ClobAuth": [
                     { "name": "address", "type": "address" },
                     { "name": "timestamp", "type": "string" },
