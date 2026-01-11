@@ -1194,6 +1194,7 @@ impl PolymarketClient {
             api_secret: Some(creds.secret),
             passphrase: Some(creds.passphrase),
         })
+    }
 
     /// Get today's fills for rebate estimation
     pub async fn get_todays_fills(&self) -> Result<Vec<Fill>> {
