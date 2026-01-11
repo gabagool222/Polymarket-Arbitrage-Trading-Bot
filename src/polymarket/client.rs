@@ -1167,8 +1167,15 @@ impl PolymarketClient {
         }
         
         // Create full signature bytes [r, s, v]
-        let mut sig_bytes = signature.r.as_bytes().to_vec();
-        sig_bytes.extend_from_slice(&signature.s.as_bytes());
+        let mut r_bytes = [0u8; 32];
+        signature.r.to_big_endian(&mut r_bytes);
+        
+        let mut s_bytes = [0u8; 32];
+        signature.s.to_big_endian(&mut s_bytes);
+        
+        let mut sig_bytes = Vec::new();
+        sig_bytes.extend_from_slice(&r_bytes);
+        sig_bytes.extend_from_slice(&s_bytes);
         sig_bytes.push(signature.v as u8);
         
         let sig_hex = format!("0x{}", hex::encode(sig_bytes));
