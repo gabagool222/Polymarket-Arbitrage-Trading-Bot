@@ -1266,8 +1266,8 @@ impl PolymarketClient {
         // Sign: timestamp + method + path + body
         let message = format!("{}{}{}{}", timestamp, method, path, body_str);
         
-        // Decode base64 secret
-        let secret_bytes = base64::engine::general_purpose::STANDARD
+        // Decode base64 secret (URL Safe because it contains - and _)
+        let secret_bytes = base64::engine::general_purpose::URL_SAFE
             .decode(api_secret)
             .context("Failed to decode API secret")?;
 
