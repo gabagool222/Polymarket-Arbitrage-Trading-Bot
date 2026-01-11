@@ -372,67 +372,79 @@ impl PolymarketClient {
     }
 
     /// Fetch active 15-minute crypto binary markets with proper yes/no token mapping
-    /// Uses /events endpoint (NOT /markets) with proper sorting to find updown-15m events
-    /// Supports BTC, ETH, SOL, and XRP
+    /// Uses calculated timestamps and parallel requests for fast discovery
     pub async fn fetch_active_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
-        let mut crypto_markets = Vec::new();
+        // Calculate current 15-min window start timestamp
+        let now = chrono::Utc::now();
+        let now_ts = now.timestamp();
+        let window_start = (now_ts / 900) * 900; // Round down to nearest 15 min (900 seconds)
         
-        // Use /events endpoint with startDate sorting (newest first)
-        // This is where 15-min updown markets actually live!
-        let url = format!(
-            "{}/events?active=true&closed=false&limit=200&order=startDate&ascending=false",
-            self.gamma_url()
+        // Check current, next, and previous windows
+        let timestamps = [
+            window_start,           // Current window (active now)
+            window_start + 900,     // Next window (pre-order)
+            window_start - 900,     // Previous window (might still resolve)
+        ];
+        
+        let assets = ["btc", "eth", "sol"];
+        
+        info!(
+            "Fetching 15-min crypto markets for window: {} UTC (±15min)",
+            chrono::DateTime::from_timestamp(window_start, 0)
+                .map(|dt| dt.format("%H:%M").to_string())
+                .unwrap_or_default()
         );
 
-        info!("Fetching 15-min crypto events from Gamma API...");
-        debug!("Events URL: {}", url);
-
-        // Retry logic (3 attempts)
-        let mut attempts = 0;
-        let response = loop {
-            attempts += 1;
-            match self.http_client.get(&url).send().await {
-                Ok(resp) => break Ok(resp),
-                Err(e) => {
-                    if attempts >= 3 {
-                        break Err(e);
-                    }
-                    warn!("Failed to fetch events (attempt {}/3): {}. Retrying...", attempts, e);
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
+        // Build all slug queries
+        let mut queries = Vec::new();
+        for ts in timestamps {
+            for asset in &assets {
+                let slug = format!("{}-updown-15m-{}", asset, ts);
+                queries.push((slug, *asset));
             }
-        }.context("Failed to fetch events after 3 attempts")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Gamma API error {}: {}", status, body);
         }
 
-        let events_json: Vec<serde_json::Value> = response.json().await
-            .context("Failed to parse events response")?;
-
-        info!("Fetched {} events from Gamma API", events_json.len());
-
-        // Filter for 15-min updown events
-        for event in events_json {
-            let event_slug = event.get("slug")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+        // Execute all queries in parallel
+        let futures: Vec<_> = queries.iter().map(|(slug, asset)| {
+            let url = format!("{}/events?slug={}", self.gamma_url(), slug);
+            let client = self.http_client.clone();
+            let slug = slug.clone();
+            let asset = *asset;
             
-            // Only process updown-15m events (btc-updown-15m, eth-updown-15m, sol-updown-15m, xrp-updown-15m)
-            if !event_slug.contains("updown-15m") {
-                continue;
+            async move {
+                let resp = client.get(&url).send().await.ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let events: Vec<serde_json::Value> = resp.json().await.ok()?;
+                if events.is_empty() {
+                    return None;
+                }
+                Some((events[0].clone(), slug, asset))
             }
+        }).collect();
 
-            // Get markets from event
+        let results = futures::future::join_all(futures).await;
+
+        // Process results
+        let mut crypto_markets = Vec::new();
+        
+        for result in results.into_iter().flatten() {
+            let (event, event_slug, asset) = result;
+            
             let markets = match event.get("markets") {
                 Some(serde_json::Value::Array(arr)) => arr,
                 _ => continue,
             };
 
+            let crypto_asset = match asset {
+                "btc" => CryptoAsset::BTC,
+                "eth" => CryptoAsset::ETH,
+                "sol" => CryptoAsset::SOL,
+                _ => continue,
+            };
+
             for market in markets {
-                // Parse clobTokenIds
                 let clob_token_ids_str = market.get("clobTokenIds")
                     .and_then(|v| v.as_str())
                     .unwrap_or("[]");
@@ -444,7 +456,6 @@ impl PolymarketClient {
                     continue;
                 }
 
-                // Metadata extraction
                 let title = market.get("question")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
@@ -456,20 +467,13 @@ impl PolymarketClient {
                     .map(|s| s.to_string());
                 let accepting = market.get("acceptingOrders")
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                    .unwrap_or(false);
 
-                // Asset detection from event slug (more reliable)
-                let slug_lower = event_slug.to_lowercase();
-                let asset = if slug_lower.starts_with("btc-") {
-                    CryptoAsset::BTC
-                } else if slug_lower.starts_with("eth-") {
-                    CryptoAsset::ETH
-                } else if slug_lower.starts_with("sol-") {
-                    CryptoAsset::SOL
-                } else {
-                    // XRP and others - skip for now or add to CryptoAsset enum
+                // Skip markets not accepting orders
+                if !accepting {
+                    debug!("Skipping {} - not accepting orders", event_slug);
                     continue;
-                };
+                }
 
                 // Outcome Mapping (Up -> Index 0, Down -> Index 1)
                 let outcomes_str = market.get("outcomes")
@@ -490,46 +494,48 @@ impl PolymarketClient {
                     (token_ids[0].clone(), token_ids[1].clone())
                 };
 
+                // Avoid duplicates
+                if crypto_markets.iter().any(|m: &CryptoMarket| m.condition_id == condition_id) {
+                    continue;
+                }
+
                 debug!(
-                    "Found 15-min market: {} | {} | Yes: {}...",
-                    event_slug, asset, &yes_token_id[..8.min(yes_token_id.len())]
+                    "Found: {} | {} | Yes: {}...",
+                    event_slug, crypto_asset, &yes_token_id[..8.min(yes_token_id.len())]
                 );
 
                 crypto_markets.push(CryptoMarket {
-                    slug: event_slug.to_string(),
+                    slug: event_slug.clone(),
                     title: title.to_string(),
                     condition_id: condition_id.to_string(),
                     yes_token_id,
                     no_token_id,
-                    asset,
+                    asset: crypto_asset.clone(),
                     end_time: end_date,
                     accepting_orders: accepting,
                 });
             }
         }
 
-        // Log findings (limit to top 20 to avoid spam)
-        info!("=== DISCOVERED 15-MIN CRYPTO MARKETS (from Events API) ===");
+        // Log summary
+        info!("=== DISCOVERED 15-MIN CRYPTO MARKETS ===");
         if crypto_markets.is_empty() {
-            warn!("No 15-min crypto markets found. Check if markets are active.");
+            warn!("No active markets found. Markets may be between windows.");
         } else {
-            for (i, cm) in crypto_markets.iter().take(20).enumerate() {
+            for (i, cm) in crypto_markets.iter().take(10).enumerate() {
                 info!(
-                    "[{}] {} | {} | Active: {} | Yes: {}... / No: {}...",
+                    "[{}] {} | {} | Yes: {}...",
                     i + 1,
                     cm.asset,
-                    cm.title.chars().take(45).collect::<String>(),
-                    cm.accepting_orders,
-                    &cm.yes_token_id[..8.min(cm.yes_token_id.len())],
-                    &cm.no_token_id[..8.min(cm.no_token_id.len())]
+                    cm.title.chars().take(40).collect::<String>(),
+                    &cm.yes_token_id[..8.min(cm.yes_token_id.len())]
                 );
             }
-            if crypto_markets.len() > 20 {
-                info!("... and {} more markets (monitoring all)", crypto_markets.len() - 20);
+            if crypto_markets.len() > 10 {
+                info!("... and {} more", crypto_markets.len() - 10);
             }
         }
-        info!("Total 15-min crypto markets found: {}", crypto_markets.len());
-        info!("=========================================");
+        info!("Total markets: {}", crypto_markets.len());
 
         Ok(crypto_markets)
     }
