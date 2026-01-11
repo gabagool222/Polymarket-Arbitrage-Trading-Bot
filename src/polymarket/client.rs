@@ -1116,10 +1116,8 @@ impl PolymarketClient {
         let nonce = "0"; // 0 for derive (idempotent), can use random for create
         let msg_text = "This message attests that I control the given wallet";
         
-        // Polymarket Mainnet Chain ID
-        let chain_id = 137;
-        let verifying_contract: Address = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".parse()?;
-        let wallet_address = wallet.address();
+        // Use Checksummed Address (EIP-55)
+        let wallet_address_checksum = ethers::utils::to_checksum(&wallet_address, None);
 
         // EIP-712 ClobAuth Signing
         let typed_data_json = serde_json::json!({
@@ -1145,7 +1143,7 @@ impl PolymarketClient {
             },
             "primaryType": "ClobAuth",
             "message": {
-                "address": format!("{:#x}", wallet_address),
+                "address": wallet_address_checksum,
                 "timestamp": timestamp,
                 "nonce": nonce,
                 "message": msg_text
@@ -1165,14 +1163,16 @@ impl PolymarketClient {
         // Add query params
         let url = reqwest::Url::parse_with_params(
             &url,
-            &[("address", format!("{:#x}", wallet_address)), ("nonce", nonce.to_string())]
+            &[("address", &wallet_address_checksum), ("nonce", &nonce.to_string())]
         )?.to_string();
+        
+        info!("Auth Request URL: {}", url);
         
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("Poly-Signature", sig_hex.parse()?);
         headers.insert("Poly-Timestamp", timestamp.parse()?);
         headers.insert("Poly-Nonce", nonce.parse()?);
-        headers.insert("Poly-Address", format!("{:#x}", wallet_address).parse()?);
+        headers.insert("Poly-Address", wallet_address_checksum.parse()?);
         headers.insert("Poly-Signature-Type", "0".parse()?); // Type 0 = EOA
 
         let response = self.http_client.get(&url)

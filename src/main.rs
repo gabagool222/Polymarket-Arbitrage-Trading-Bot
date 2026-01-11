@@ -114,8 +114,9 @@ async fn main() -> Result<()> {
                         config.auth = creds;
                     },
                     Err(e) => {
-                        eprintln!("❌ Failed to derive API keys: {}", e);
-                        eprintln!("⚠️  Bot will likely fail to place orders.");
+                        eprintln!("❌ FATAL: Failed to derive API keys: {}", e);
+                        eprintln!("⚠️  Cannot proceed in Real Mode without API Keys.");
+                        std::process::exit(1);
                     }
                 }
             },
