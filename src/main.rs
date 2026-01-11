@@ -473,9 +473,8 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
                     stats.net_pnl
                 );
 
-                if let Some(ref sim) = sim_engine {
-                    sim.print_summary().await;
-                }
+                // Note: SimulationEngine's internal counters aren't used (trades go through TradingEngine)
+                // Daily Stats above already shows the accurate trade data
             }
 
             // Graceful shutdown on Ctrl+C
