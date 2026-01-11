@@ -1177,8 +1177,8 @@ impl PolymarketClient {
         headers.insert("Poly-Signature", sig_hex.parse()?);
         headers.insert("Poly-Timestamp", timestamp.parse()?);
         headers.insert("Poly-Nonce", nonce.parse()?);
-        headers.insert("Poly-Address", wallet_address_checksum.parse()?);
-        headers.insert("Poly-Signature-Type", "0".parse()?); // Type 0 = EOA
+        // headers.insert("Poly-Address", wallet_address_checksum.parse()?); // Not needed in header if in query
+        // headers.insert("Poly-Signature-Type", "0".parse()?); // Not strictly needed for derive?
 
         let response = self.http_client.get(&url)
             .headers(headers)
