@@ -1158,9 +1158,20 @@ impl PolymarketClient {
         let typed_data: ethers::types::transaction::eip712::TypedData = serde_json::from_value(typed_data_json)
             .context("Failed to parse Auth TypedData")?;
             
-        let signature = wallet.sign_typed_data(&typed_data).await
+        let mut signature = wallet.sign_typed_data(&typed_data).await
             .context("Failed to sign Auth message")?;
-        let sig_hex = format!("0x{}", hex::encode(signature.to_vec()));
+        
+        // Adjust v for Ethereum standard (27/28) if needed
+        if signature.v < 27 {
+            signature.v += 27;
+        }
+        
+        // Create full signature bytes [r, s, v]
+        let mut sig_bytes = signature.r.as_bytes().to_vec();
+        sig_bytes.extend_from_slice(&signature.s.as_bytes());
+        sig_bytes.push(signature.v as u8);
+        
+        let sig_hex = format!("0x{}", hex::encode(sig_bytes));
 
         // Call /auth/derive-api-key with Query Params + Headers
         let url = format!("{}/auth/derive-api-key", self.api_url());
@@ -1177,8 +1188,8 @@ impl PolymarketClient {
         headers.insert("Poly-Signature", sig_hex.parse()?);
         headers.insert("Poly-Timestamp", timestamp.parse()?);
         headers.insert("Poly-Nonce", nonce.parse()?);
-        // headers.insert("Poly-Address", wallet_address_checksum.parse()?); // Not needed in header if in query
-        // headers.insert("Poly-Signature-Type", "0".parse()?); // Not strictly needed for derive?
+        headers.insert("Poly-Address", wallet_address_checksum.parse()?);
+        headers.insert("Poly-Signature-Type", "0".parse()?); // Type 0 = EOA
 
         let response = self.http_client.get(&url)
             .headers(headers)
