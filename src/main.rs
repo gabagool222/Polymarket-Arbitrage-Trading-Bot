@@ -257,6 +257,11 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
     // Key: token_id, Value: (best_bid, best_ask, last_price, timestamp)
     type PriceData = (Option<Decimal>, Option<Decimal>, Decimal, chrono::DateTime<chrono::Utc>);
     let price_cache: Arc<RwLock<HashMap<String, PriceData>>> = Arc::new(RwLock::new(HashMap::new()));
+    
+    // === THROTTLE MAP ===
+    // Prevent processing same market more than once per 500ms
+    let mut last_process_time: HashMap<String, std::time::Instant> = HashMap::new();
+    let throttle_ms = 500; // Minimum ms between processing same market
 
     // Main event loop
     let mut last_binance_move: Option<PriceMove> = None;
@@ -344,6 +349,15 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
                 if let Some(market) = markets.iter().find(|m|
                     m.yes_token_id == update.token_id || m.no_token_id == update.token_id
                 ) {
+                    // Throttle: skip if we processed this market recently
+                    let now = std::time::Instant::now();
+                    if let Some(last_time) = last_process_time.get(&market.condition_id) {
+                        if now.duration_since(*last_time).as_millis() < throttle_ms as u128 {
+                            continue; // Skip, processed too recently
+                        }
+                    }
+                    last_process_time.insert(market.condition_id.clone(), now);
+                    
                     // Try to build prices from cache first
                     let cache = price_cache.read().await;
                     

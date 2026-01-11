@@ -471,6 +471,22 @@ impl TradingEngine {
     /// Open a new hedge trade
     async fn open_trade(&self, signal: Signal) -> Result<()> {
         let is_simulated = self.config.is_test_mode();
+        
+        // Check if there's already an active trade for this market
+        {
+            let active = self.active_trades.read().await;
+            let existing = active.values().find(|t| {
+                t.market_id == signal.market_id && 
+                t.status != HedgeStatus::Complete && 
+                t.status != HedgeStatus::TimedOut &&
+                t.status != HedgeStatus::Cancelled
+            });
+            
+            if existing.is_some() {
+                debug!("Already have active trade for market {}, skipping", signal.market_id);
+                return Ok(());
+            }
+        }
 
         // Resolve token ID from signal or fallback
         let token_id = if let Some(id) = &signal.token_id {
@@ -839,7 +855,7 @@ impl TradingEngine {
         // Verify profitability
         let total_cost = leg1.price + price;
         if total_cost >= Decimal::ONE {
-            warn!(
+            debug!(
                 "Leg 2 would not be profitable: {} + {} = {}",
                 leg1.price, price, total_cost
             );

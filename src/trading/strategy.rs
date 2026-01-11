@@ -26,10 +26,10 @@ impl HedgingStrategy {
         let sum = prices.price_sum();
         let threshold = self.config.trading.min_profit_threshold;
 
-        // LOG SETIAP PRICE CHECK untuk debug
-        info!(
-            "Price check: Yes={:.4} + No={:.4} = {:.4} | Threshold={:.4} | Edge={:.4}",
-            prices.yes_price, prices.no_price, sum, threshold, threshold - sum
+        // Debug level logging for price checks (avoid log flood)
+        debug!(
+            "Price check: Yes={:.4} + No={:.4} = {:.4} | Edge={:.4}",
+            prices.yes_price, prices.no_price, sum, threshold - sum
         );
 
         if sum >= threshold {
@@ -40,7 +40,7 @@ impl HedgingStrategy {
         let min_edge = Decimal::new(self.config.trading.min_edge_cents as i64, 2);
 
         if edge < min_edge && min_edge > Decimal::ZERO {
-            info!("Edge {:.4} too small, min required: {:.4}", edge, min_edge);
+            debug!("Edge {:.4} too small, min required: {:.4}", edge, min_edge);
             return None;
         }
 
@@ -95,7 +95,7 @@ impl HedgingStrategy {
         let total_shares = leg1.filled_size.min(size);
 
         if total_cost >= total_shares {
-            warn!(
+            debug!(
                 "Leg 2 would not be profitable: cost {} >= payout {}",
                 total_cost, total_shares
             );
