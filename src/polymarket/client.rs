@@ -1178,14 +1178,8 @@ impl PolymarketClient {
         
         let sig_hex = format!("0x{}", hex::encode(sig_bytes));
 
-        // Call /auth/derive-api-key with Query Params + Headers
+        // Call /auth/derive-api-key using HEADERS ONLY (No Query Params)
         let url = format!("{}/auth/derive-api-key", self.api_url());
-        
-        // Add query params
-        let url = reqwest::Url::parse_with_params(
-            &url,
-            &[("address", &wallet_address_checksum), ("nonce", &nonce.to_string())]
-        )?.to_string();
         
         info!("Auth Request URL: {}", url);
         
