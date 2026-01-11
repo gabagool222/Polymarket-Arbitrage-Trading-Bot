@@ -378,6 +378,10 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
                     let yes_data = cache.get(&market.yes_token_id);
                     let no_data = cache.get(&market.no_token_id);
                     
+                    // Store whether we have data before processing
+                    let yes_has_data = yes_data.is_some();
+                    let no_has_data = no_data.is_some();
+                    
                     // Calculate prices from cached bid/ask or last_price
                     let yes_price = yes_data.and_then(|(bid, ask, last_price, _)| {
                         // Priority: mid_price from bid/ask > last_price
@@ -400,7 +404,7 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
                     
                     drop(cache); // Release read lock
                     
-                    // Build MarketPrices from cache or fallback to API fetch
+                    // Build MarketPrices from cache or skip if incomplete
                     let prices = if let (Some(yp), Some(np)) = (yes_price, no_price) {
                         // Use cached prices
                         if yp > Decimal::ZERO && np > Decimal::ZERO {
@@ -427,8 +431,8 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
                         debug!(
                             "Waiting for WebSocket data on {} (Yes: {}, No: {})",
                             market.asset,
-                            yes_data.is_some(),
-                            no_data.is_some()
+                            yes_has_data,
+                            no_has_data
                         );
                         continue;
                     };
