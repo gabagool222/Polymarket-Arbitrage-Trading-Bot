@@ -4,11 +4,14 @@ use crate::config::AppConfig;
 use crate::polymarket::types::*;
 use anyhow::{Context, Result};
 use ethers::prelude::*;
+use hmac::{Hmac, Mac};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+use base64::Engine;
 
 /// Polymarket CLOB client for REST API interactions
 pub struct PolymarketClient {
@@ -751,14 +754,21 @@ impl PolymarketClient {
             .context("Wallet not initialized for real trading")?;
 
         // Build and sign the order
+        // Build and sign the order
         let signed_order = self.build_signed_order(order, wallet).await?;
+
+        // Prepare L2 Auth Headers
+        let req_body = CreateOrderRequest { order: signed_order };
+        let body_str = serde_json::to_string(&req_body)?;
+        let auth_headers = self.build_auth_headers("POST", "/order", &body_str)?;
 
         let url = format!("{}/order", self.api_url());
 
         let response = self
             .http_client
             .post(&url)
-            .json(&CreateOrderRequest { order: signed_order })
+            .headers(auth_headers)
+            .body(body_str)
             .send()
             .await
             .context("Failed to place order")?;
@@ -926,11 +936,15 @@ impl PolymarketClient {
             return Ok(());
         }
 
-        let url = format!("{}/order/{}", self.api_url(), order_id);
+        let path = format!("/order/{}", order_id);
+        let url = format!("{}{}", self.api_url(), path);
+
+        let auth_headers = self.build_auth_headers("DELETE", &path, "")?;
 
         let response = self
             .http_client
             .delete(&url)
+            .headers(auth_headers)
             .send()
             .await
             .context("Failed to cancel order")?;
@@ -1098,6 +1112,49 @@ impl PolymarketClient {
             .into_iter()
             .filter(|f| f.timestamp.date_naive() == today)
             .collect())
+    }
+
+    /// Build L2 Authentication Headers (HMAC-SHA256)
+    fn build_auth_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body_str: &str,
+    ) -> Result<reqwest::header::HeaderMap> {
+        let auth = &self.config.auth;
+        
+        // Only return error if we are in REAL mode
+        if self.config.is_test_mode() {
+            return Ok(reqwest::header::HeaderMap::new());
+        }
+
+        let api_key = auth.api_key.as_ref().context("API Key not configured")?;
+        let api_secret = auth.api_secret.as_ref().context("API Secret not configured")?;
+        let passphrase = auth.passphrase.as_ref().context("Passphrase not configured")?;
+
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        
+        // Sign: timestamp + method + path + body
+        let message = format!("{}{}{}{}", timestamp, method, path, body_str);
+        
+        // Decode base64 secret
+        let secret_bytes = base64::engine::general_purpose::STANDARD
+            .decode(api_secret)
+            .context("Failed to decode API secret")?;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(&secret_bytes)
+            .context("Failed to create HMAC")?;
+        mac.update(message.as_bytes());
+        let result = mac.finalize();
+        let signature = base64::engine::general_purpose::STANDARD.encode(result.into_bytes());
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Poly-Api-Key", api_key.parse()?);
+        headers.insert("Poly-Timestamp", timestamp.parse()?);
+        headers.insert("Poly-Signature", signature.parse()?);
+        headers.insert("Poly-Passphrase", passphrase.parse()?);
+
+        Ok(headers)
     }
 
     /// Estimate daily rebates based on filled maker volume

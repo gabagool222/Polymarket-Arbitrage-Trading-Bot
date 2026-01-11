@@ -272,9 +272,19 @@ impl Default for MakerRebatesConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuthConfig {
+    pub api_key: Option<String>,
+    pub api_secret: Option<String>,
+    pub passphrase: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub general: GeneralConfig,
+
+    #[serde(default)]
+    pub auth: AuthConfig, // Added AuthConfig
 
     #[serde(default)]
     pub wallet: WalletConfig,
@@ -379,6 +389,17 @@ impl AppConfig {
         // Market making enabled override
         if let Ok(enabled) = std::env::var("POLY_MARKET_MAKING_ENABLED") {
             self.maker_rebates.enable_market_making = enabled.to_lowercase() == "true" || enabled == "1";
+        }
+
+        // L2 Auth Credentials
+        if let Ok(key) = std::env::var("POLY_API_KEY") {
+            self.auth.api_key = Some(key);
+        }
+        if let Ok(secret) = std::env::var("POLY_API_SECRET") {
+            self.auth.api_secret = Some(secret);
+        }
+        if let Ok(passphrase) = std::env::var("POLY_PASSPHRASE") {
+            self.auth.passphrase = Some(passphrase);
         }
     }
 
