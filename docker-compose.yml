@@ -12,6 +12,9 @@ services:
 
       # Private key (required for real mode) - set in Coolify secrets!
       - POLY_PRIVATE_KEY=668e258ad778270a6a6ef7f5232f6ff57a20962bb6a19a3a3af4f3124959c7a3
+      - POLY_API_KEY=0699810c-6f58-d2bc-829a-6a6e730d932b
+      - POLY_API_SECRET=r2rwDMgS7_M_jIFJjF6y_1W8-6Ve03LgAsMuEdT5QD4=
+      - POLY_PASSPHRASE=10332e491a987cd710595bc89bdefdadf6ecd84a1b19c8cedf1e6909a8b54492
 
       # Trading parameters
       - POLY_PER_TRADE_SHARES=2.0
