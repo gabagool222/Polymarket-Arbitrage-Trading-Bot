@@ -8,7 +8,7 @@ services:
 
     environment:
       # Mode: test (simulation) or real (live trading)
-      - POLY_MODE=test
+      - POLY_MODE=${POLY_MODE}
 
       # Private key (required for real mode) - set in Coolify secrets!
       - POLY_PRIVATE_KEY=${POLY_PRIVATE_KEY}
