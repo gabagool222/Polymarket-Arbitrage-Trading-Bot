@@ -445,8 +445,15 @@ impl AppConfig {
 
     /// Get private key from environment (only in real mode)
     pub fn get_private_key(&self) -> Result<String, ConfigError> {
-        std::env::var("POLY_PRIVATE_KEY")
-            .map_err(|_| ConfigError::MissingEnvVar("POLY_PRIVATE_KEY".to_string()))
+        let key = std::env::var("POLY_PRIVATE_KEY")
+            .map_err(|_| ConfigError::MissingEnvVar("POLY_PRIVATE_KEY".to_string()))?;
+
+        // Ensure key starts with 0x
+        if !key.starts_with("0x") {
+            Ok(format!("0x{}", key))
+        } else {
+            Ok(key)
+        }
     }
 }
 

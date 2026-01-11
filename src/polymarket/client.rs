@@ -1116,6 +1116,11 @@ impl PolymarketClient {
         let nonce = "0"; // 0 for derive (idempotent), can use random for create
         let msg_text = "This message attests that I control the given wallet";
         
+        // Polymarket Mainnet Chain ID
+        let chain_id = 137;
+        let verifying_contract: Address = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".parse()?;
+        let wallet_address = wallet.address();
+        
         // Use Checksummed Address (EIP-55)
         let wallet_address_checksum = ethers::utils::to_checksum(&wallet_address, None);
 
