@@ -25,6 +25,32 @@ impl HedgingStrategy {
     pub fn check_opportunity(&self, prices: &MarketPrices) -> Option<Signal> {
         let sum = prices.price_sum();
         let threshold = self.config.trading.min_profit_threshold;
+        
+        // === SANITY CHECKS ===
+        // Reject unrealistic prices (likely stale/corrupt data from closed markets)
+        
+        // 1. Both prices must be in valid range [0.02, 0.98]
+        let min_valid = Decimal::new(2, 2);  // 0.02
+        let max_valid = Decimal::new(98, 2); // 0.98
+        
+        if prices.yes_price < min_valid || prices.yes_price > max_valid ||
+           prices.no_price < min_valid || prices.no_price > max_valid {
+            debug!(
+                "Price out of valid range: Yes={:.4} No={:.4} (valid: 0.02-0.98)",
+                prices.yes_price, prices.no_price
+            );
+            return None;
+        }
+        
+        // 2. Sum must be realistic (> 0.50) - if sum is too low, data is corrupt
+        let min_sum = Decimal::new(50, 2); // 0.50
+        if sum < min_sum {
+            warn!(
+                "Rejecting suspicious opportunity: Yes={:.4} + No={:.4} = {:.4} (sum too low, likely stale data)",
+                prices.yes_price, prices.no_price, sum
+            );
+            return None;
+        }
 
         // Debug level logging for price checks (avoid log flood)
         debug!(
