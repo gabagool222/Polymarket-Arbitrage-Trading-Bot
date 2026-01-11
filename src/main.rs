@@ -94,9 +94,33 @@ async fn main() -> Result<()> {
     }
     config.logging.log_level = args.log_level.clone();
 
+    // Apply CLI overrides
     if let Some(shares) = args.per_trade_shares {
         config.trading.per_trade_shares = Decimal::try_from(shares)
             .unwrap_or(Decimal::new(20, 1));
+    }
+
+    // Auto-derive L2 API Keys if missing in Real Mode
+    if config.is_real_mode() && config.auth.api_key.is_none() {
+        println!("🔑 API Keys missing in config. Attempting to auto-derive using Private Key...");
+        
+        let temp_config = Arc::new(config.clone());
+        match polyarb::polymarket::client::PolymarketClient::new(temp_config) {
+            Ok(temp_client) => {
+                match temp_client.derive_api_keys().await {
+                    Ok(creds) => {
+                        println!("✅ API Credentials Derived Successfully!");
+                        println!("ℹ️  API Key: {}", creds.api_key.as_deref().unwrap_or("?"));
+                        config.auth = creds;
+                    },
+                    Err(e) => {
+                        eprintln!("❌ Failed to derive API keys: {}", e);
+                        eprintln!("⚠️  Bot will likely fail to place orders.");
+                    }
+                }
+            },
+            Err(e) => eprintln!("❌ Failed to create client for derivation: {}", e),
+        }
     }
 
     let config = Arc::new(config);

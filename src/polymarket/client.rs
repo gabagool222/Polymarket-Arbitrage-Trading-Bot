@@ -1103,6 +1103,98 @@ impl PolymarketClient {
             .collect())
     }
 
+    /// Automatically derive API credentials (L2) from Private Key (L1)
+    /// This removes the need for users to manually generate API keys via scripts
+    pub async fn derive_api_keys(&self) -> Result<crate::config::AuthConfig> {
+        let wallet = self.wallet.as_ref()
+            .context("Wallet not initialized. Private key required for creating API keys.")?;
+
+        info!("Deriving L2 API Keys from Private Key...");
+        
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let nonce = "0"; // 0 for derive (idempotent), can use random for create
+        let msg_text = "This message attests that I control the given wallet";
+        
+        // Polymarket Mainnet Chain ID
+        let chain_id = 137;
+        let verifying_contract: Address = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".parse()?;
+        let wallet_address = wallet.address();
+
+        // EIP-712 ClobAuth Signing
+        let typed_data_json = serde_json::json!({
+            "domain": {
+                "name": "ClobAuthDomain",
+                "version": "1",
+                "chainId": chain_id,
+                "verifyingContract": verifying_contract,
+            },
+            "types": {
+                "EIP712Domain": [
+                    { "name": "name", "type": "string" },
+                    { "name": "version", "type": "string" },
+                    { "name": "chainId", "type": "uint256" },
+                    { "name": "verifyingContract", "type": "address" },
+                ],
+                "ClobAuth": [
+                    { "name": "address", "type": "address" },
+                    { "name": "timestamp", "type": "string" },
+                    { "name": "nonce", "type": "uint256" },
+                    { "name": "message", "type": "string" },
+                ]
+            },
+            "primaryType": "ClobAuth",
+            "message": {
+                "address": format!("{:?}", wallet_address),
+                "timestamp": timestamp,
+                "nonce": nonce,
+                "message": msg_text
+            }
+        });
+
+        let typed_data: ethers::types::transaction::eip712::TypedData = serde_json::from_value(typed_data_json)
+            .context("Failed to parse Auth TypedData")?;
+            
+        let signature = wallet.sign_typed_data(&typed_data).await
+            .context("Failed to sign Auth message")?;
+        let sig_hex = format!("0x{}", hex::encode(signature.to_vec()));
+
+        // Call /auth/derive-api-key
+        let url = format!("{}/auth/derive-api-key", self.api_url());
+        
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Poly-Signature", sig_hex.parse()?);
+        headers.insert("Poly-Timestamp", timestamp.parse()?);
+        headers.insert("Poly-Nonce", nonce.parse()?);
+        headers.insert("Poly-Address", format!("{:?}", wallet_address).parse()?);
+
+        let response = self.http_client.get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .context("Failed to send auth request")?;
+
+        if !response.status().is_success() {
+            let body = response.text().await?;
+            anyhow::bail!("Failed to derive API keys: {}", body);
+        }
+
+        #[derive(Deserialize)]
+        struct DeriveResp {
+            #[serde(rename = "apiKey")]
+            api_key: String,
+            secret: String,
+            passphrase: String,
+        }
+        
+        let creds: DeriveResp = response.json().await
+            .context("Failed to parse Auth response")?;
+        
+        Ok(crate::config::AuthConfig {
+            api_key: Some(creds.api_key),
+            api_secret: Some(creds.secret),
+            passphrase: Some(creds.passphrase),
+        })
+
     /// Get today's fills for rebate estimation
     pub async fn get_todays_fills(&self) -> Result<Vec<Fill>> {
         let all_fills = self.get_fills(None).await?;
