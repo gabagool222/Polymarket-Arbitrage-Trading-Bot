@@ -140,7 +140,21 @@ fn print_banner(config: &AppConfig, args: &Args) {
         info!("");
     } else {
         warn!("");
-        warn!("⚠️  RUNNING IN REAL MODE - REAL FUNDS WILL BE USED!");
+        warn!("╔══════════════════════════════════════════════════════════════╗");
+        warn!("║  ⚠️  WARNING: REAL MODE - REAL FUNDS WILL BE USED!           ║");
+        warn!("║                                                              ║");
+        warn!("║  Safety limits active:                                       ║");
+        warn!("║  • Max 100 trades per day                                    ║");
+        warn!("║  • Circuit breaker at -$50 loss                              ║");
+        warn!("║  • Press Ctrl+C NOW to abort if this is unintended!         ║");
+        warn!("╚══════════════════════════════════════════════════════════════╝");
+        warn!("");
+        warn!("⏳ Starting in 10 seconds... (Ctrl+C to abort)");
+        for i in (1..=10).rev() {
+            warn!("   {}...", i);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        warn!("🚀 STARTING REAL TRADING NOW!");
         warn!("");
     }
 }
@@ -403,35 +417,20 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
                                 timestamp: chrono::Utc::now(),
                             }
                         } else {
-                            // Zero prices from cache - fallback to API
-                            warn!("Cached prices are zero, fetching orderbook...");
-                            match client.fetch_crypto_market_prices(market).await {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    warn!("Failed to fetch market prices: {}", e);
-                                    continue;
-                                }
-                            }
+                            // Zero prices from cache - skip this market
+                            debug!("Cached prices are zero for {}, waiting for real data...", market.asset);
+                            continue;
                         }
                     } else {
-                        // Not enough cached data - fallback to API fetch
-                        debug!("Incomplete cache for {}, fetching orderbook...", market.asset);
-                        match client.fetch_crypto_market_prices(market).await {
-                            Ok(p) => {
-                                // Log if we're getting default values
-                                if p.yes_price == Decimal::new(5, 1) && p.no_price == Decimal::new(5, 1) {
-                                    warn!(
-                                        "⚠️ {} orderbook empty! Using defaults (0.50/0.50). Check API.",
-                                        market.asset
-                                    );
-                                }
-                                p
-                            },
-                            Err(e) => {
-                                warn!("Failed to fetch market prices: {}", e);
-                                continue;
-                            }
-                        }
+                        // Not enough cached data - skip and wait for WebSocket to populate both sides
+                        // DO NOT fallback to orderbook API (often returns empty/stale data)
+                        debug!(
+                            "Waiting for WebSocket data on {} (Yes: {}, No: {})",
+                            market.asset,
+                            yes_data.is_some(),
+                            no_data.is_some()
+                        );
+                        continue;
                     };
 
                     // Process with trading engine

@@ -472,6 +472,37 @@ impl TradingEngine {
     async fn open_trade(&self, signal: Signal) -> Result<()> {
         let is_simulated = self.config.is_test_mode();
         
+        // === SAFETY CHECK 1: Daily trade limit ===
+        {
+            let stats = self.daily_stats.read().await;
+            let max_daily_trades: u32 = 100; // Hard limit
+            if stats.trades_count >= max_daily_trades {
+                warn!("🛑 Daily trade limit reached ({}/{}), stopping", stats.trades_count, max_daily_trades);
+                return Ok(());
+            }
+        }
+        
+        // === SAFETY CHECK 2: Max loss circuit breaker ===
+        {
+            let stats = self.daily_stats.read().await;
+            let max_loss = Decimal::new(-50, 0); // -$50 hard stop
+            if stats.net_pnl < max_loss {
+                error!("🛑 CIRCUIT BREAKER: Daily loss ${} exceeds limit ${}", stats.net_pnl, max_loss);
+                return Ok(());
+            }
+        }
+        
+        // === SAFETY CHECK 3: Real mode warning ===
+        if !is_simulated {
+            warn!(
+                "⚡ REAL TRADE: {} {} @ {} for {}",
+                signal.token_type,
+                signal.suggested_size,
+                signal.suggested_price,
+                signal.market_id
+            );
+        }
+        
         // Check if there's already an active trade for this market
         {
             let active = self.active_trades.read().await;

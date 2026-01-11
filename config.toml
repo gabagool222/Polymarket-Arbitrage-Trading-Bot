@@ -101,6 +101,15 @@ loss_cooldown_sec = 60
 # Maximum consecutive losses before pause
 max_consecutive_losses = 3
 
+# === REAL TRADING SAFETY LIMITS ===
+
+# Maximum trades per day (hard limit)
+max_trades_per_day = 100
+
+# Circuit breaker: Stop all trading if daily loss exceeds this amount (in dollars)
+# Negative value, e.g., -50 means stop if we lose $50
+circuit_breaker_loss = -50.0
+
 [logging]
 # Log level: trace, debug, info, warn, error
 log_level = "info"

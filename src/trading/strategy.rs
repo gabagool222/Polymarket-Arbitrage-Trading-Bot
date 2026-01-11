@@ -42,11 +42,12 @@ impl HedgingStrategy {
             return None;
         }
         
-        // 2. Sum must be realistic (> 0.50) - if sum is too low, data is corrupt
-        let min_sum = Decimal::new(50, 2); // 0.50
+        // 2. Sum must be realistic (> 0.90) - in real binary markets, sum ≈ 0.98-1.02
+        // If sum is too low, one side likely has stale/default data (e.g., 0.50 from empty orderbook)
+        let min_sum = Decimal::new(90, 2); // 0.90
         if sum < min_sum {
             warn!(
-                "Rejecting suspicious opportunity: Yes={:.4} + No={:.4} = {:.4} (sum too low, likely stale data)",
+                "Rejecting suspicious opportunity: Yes={:.4} + No={:.4} = {:.4} (sum < 0.90, likely stale data)",
                 prices.yes_price, prices.no_price, sum
             );
             return None;
