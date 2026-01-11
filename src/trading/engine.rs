@@ -763,6 +763,18 @@ impl TradingEngine {
                             "🎉 Trade {} COMPLETE! Leg2 filled. PNL: ${:.4} (cost: ${:.4}, payout: ${:.4})",
                             trade_id, pnl, total_cost, payout
                         );
+                        
+                        // Update daily stats
+                        {
+                            let mut stats = self.daily_stats.write().await;
+                            stats.trades_count += 1;
+                            stats.net_pnl += pnl;
+                            if pnl > Decimal::ZERO {
+                                stats.wins += 1;
+                            } else {
+                                stats.losses += 1;
+                            }
+                        }
                     }
                 }
             }
