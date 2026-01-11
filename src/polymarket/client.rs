@@ -1104,119 +1104,132 @@ impl PolymarketClient {
             .collect())
     }
 
-    /// Automatically derive API credentials (L2) from Private Key (L1)
-    /// This removes the need for users to manually generate API keys via scripts
+    /// Fetch Server Time to avoid Clock Skew
+    pub async fn get_server_time(&self) -> Result<i64> {
+        let url = format!("{}/time", self.api_url());
+        let resp = self.http_client.get(&url).send().await;
+        
+        match resp {
+            Ok(r) => {
+                #[derive(Deserialize)]
+                struct TimeResp { timestamp: i64 } // server returns int timestamp
+                // Or sometimes just "iso". Let's try simple json.
+                // If fails, fallback to local.
+                let t_json: serde_json::Value = r.json().await?;
+                if let Some(ts) = t_json.get("timestamp").and_then(|v| v.as_i64()) {
+                   return Ok(ts);
+                }
+            }
+            Err(_) => {}
+        }
+        // Fallback to local time
+        Ok(chrono::Utc::now().timestamp())
+    }
+
+    /// Automatically derive API credentials...
     pub async fn derive_api_keys(&self) -> Result<crate::config::AuthConfig> {
         let wallet = self.wallet.as_ref()
             .context("Wallet not initialized. Private key required for creating API keys.")?;
 
         info!("Deriving L2 API Keys from Private Key...");
         
-        let timestamp = chrono::Utc::now().timestamp().to_string();
-        let nonce = "0"; // 0 for derive (idempotent), can use random for create
-        let msg_text = "This message attests that I control the given wallet";
-        
-        // Polymarket Mainnet Chain ID
-        let chain_id = 137;
-        let wallet_address = wallet.address();
-        
-        // Use Checksummed Address (EIP-55)
-        let wallet_address_checksum = ethers::utils::to_checksum(&wallet_address, None);
-
-        // EIP-712 ClobAuth Signing
-        let typed_data_json = serde_json::json!({
-            "domain": {
-                "name": "ClobAuthDomain",
-                "version": "1",
-                "chainId": chain_id,
-            },
-            "types": {
-                "EIP712Domain": [
-                    { "name": "name", "type": "string" },
-                    { "name": "version", "type": "string" },
-                    { "name": "chainId", "type": "uint256" },
-                ],
-                "ClobAuth": [
-                    { "name": "address", "type": "address" },
-                    { "name": "timestamp", "type": "string" },
-                    { "name": "nonce", "type": "uint256" },
-                    { "name": "message", "type": "string" },
-                ]
-            },
-
-            "primaryType": "ClobAuth",
-            "message": {
-                "address": wallet_address_checksum,
-                "timestamp": timestamp,
-                "nonce": nonce,
-                "message": msg_text
-            }
-        });
-
-        let typed_data: ethers::types::transaction::eip712::TypedData = serde_json::from_value(typed_data_json)
-            .context("Failed to parse Auth TypedData")?;
+        // Retry Loop
+        let mut last_error = String::new();
+        for attempt in 1..=3 {
+            info!("Derive attempt {}/3...", attempt);
             
-        let mut signature = wallet.sign_typed_data(&typed_data).await
-            .context("Failed to sign Auth message")?;
-        
-        // Adjust v for Ethereum standard (27/28) if needed
-        if signature.v < 27 {
-            signature.v += 27;
+            // 1. Get accurate timestamp (Server Time preferred)
+            let timestamp_val = self.get_server_time().await.unwrap_or_else(|_| chrono::Utc::now().timestamp());
+            let timestamp = timestamp_val.to_string();
+            
+            info!("Using Timestamp: {}", timestamp);
+            
+            let nonce = "0"; 
+            let msg_text = "This message attests that I control the given wallet";
+            
+            // ... (Rest of logic: ChainID, Checksum, TypedData) ...
+            let chain_id = 137;
+            let wallet_address = wallet.address();
+            let wallet_address_checksum = ethers::utils::to_checksum(&wallet_address, None);
+
+            let typed_data_json = serde_json::json!({
+                "domain": {
+                    "name": "ClobAuthDomain",
+                    "version": "1",
+                    "chainId": chain_id,
+                },
+                "types": {
+                    "EIP712Domain": [
+                        { "name": "name", "type": "string" },
+                        { "name": "version", "type": "string" },
+                        { "name": "chainId", "type": "uint256" },
+                    ],
+                    "ClobAuth": [
+                        { "name": "address", "type": "address" },
+                        { "name": "timestamp", "type": "string" },
+                        { "name": "nonce", "type": "uint256" },
+                        { "name": "message", "type": "string" },
+                    ]
+                },
+                "primaryType": "ClobAuth",
+                "message": {
+                    "address": wallet_address_checksum,
+                    "timestamp": timestamp,
+                    "nonce": 0,
+                    "message": msg_text
+                }
+            });
+
+            // Sign
+            let typed_data: ethers::types::transaction::eip712::TypedData = match serde_json::from_value(typed_data_json) {
+                Ok(td) => td,
+                Err(e) => { last_error = e.to_string(); continue; }
+            };
+                
+            let mut signature = match wallet.sign_typed_data(&typed_data).await {
+                Ok(s) => s,
+                Err(e) => { last_error = e.to_string(); continue; }
+            };
+            
+            if signature.v < 27 { signature.v += 27; }
+            let mut r_bytes = [0u8; 32]; signature.r.to_big_endian(&mut r_bytes);
+            let mut s_bytes = [0u8; 32]; signature.s.to_big_endian(&mut s_bytes);
+            let mut sig_bytes = Vec::new();
+            sig_bytes.extend_from_slice(&r_bytes);
+            sig_bytes.extend_from_slice(&s_bytes);
+            sig_bytes.push(signature.v as u8);
+            let sig_hex = format!("0x{}", hex::encode(sig_bytes));
+
+            // Request
+            let url = format!("{}/auth/derive-api-key", self.api_url());
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("Poly-Signature", sig_hex.parse().unwrap());
+            headers.insert("Poly-Timestamp", timestamp.parse().unwrap());
+            headers.insert("Poly-Nonce", nonce.parse().unwrap());
+            headers.insert("Poly-Address", wallet_address_checksum.parse().unwrap());
+
+            let response = match self.http_client.get(&url).headers(headers).send().await {
+                Ok(r) => r,
+                Err(e) => { last_error = e.to_string(); tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; continue; }
+            };
+
+            if response.status().is_success() {
+                 #[derive(Deserialize)]
+                struct DeriveResp { #[serde(rename = "apiKey")] api_key: String, secret: String, passphrase: String }
+                let creds: DeriveResp = response.json().await.context("Parse error")?;
+                
+                return Ok(crate::config::AuthConfig {
+                    api_key: Some(creds.api_key), api_secret: Some(creds.secret), passphrase: Some(creds.passphrase)
+                });
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                warn!("Derive attempt {} failed: {}", attempt, body);
+                last_error = body;
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
         }
         
-        // Create full signature bytes [r, s, v]
-        let mut r_bytes = [0u8; 32];
-        signature.r.to_big_endian(&mut r_bytes);
-        
-        let mut s_bytes = [0u8; 32];
-        signature.s.to_big_endian(&mut s_bytes);
-        
-        let mut sig_bytes = Vec::new();
-        sig_bytes.extend_from_slice(&r_bytes);
-        sig_bytes.extend_from_slice(&s_bytes);
-        sig_bytes.push(signature.v as u8);
-        
-        let sig_hex = format!("0x{}", hex::encode(sig_bytes));
-
-        // Call /auth/derive-api-key using HEADERS ONLY (No Query Params)
-        let url = format!("{}/auth/derive-api-key", self.api_url());
-        
-        info!("Auth Request URL: {}", url);
-        
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("Poly-Signature", sig_hex.parse()?);
-        headers.insert("Poly-Timestamp", timestamp.parse()?);
-        headers.insert("Poly-Nonce", nonce.parse()?);
-        headers.insert("Poly-Address", wallet_address_checksum.parse()?);
-        headers.insert("Poly-Signature-Type", "0".parse()?); // Type 0 = EOA
-
-        let response = self.http_client.get(&url)
-            .headers(headers)
-            .send()
-            .await
-            .context("Failed to send auth request")?;
-
-        if !response.status().is_success() {
-            let body = response.text().await?;
-            anyhow::bail!("Failed to derive API keys: {}", body);
-        }
-
-        #[derive(Deserialize)]
-        struct DeriveResp {
-            #[serde(rename = "apiKey")]
-            api_key: String,
-            secret: String,
-            passphrase: String,
-        }
-        
-        let creds: DeriveResp = response.json().await
-            .context("Failed to parse Auth response")?;
-        
-        Ok(crate::config::AuthConfig {
-            api_key: Some(creds.api_key),
-            api_secret: Some(creds.secret),
-            passphrase: Some(creds.passphrase),
-        })
+        anyhow::bail!("All derive attempts failed. Last error: {}", last_error);
     }
 
     /// Get today's fills for rebate estimation
