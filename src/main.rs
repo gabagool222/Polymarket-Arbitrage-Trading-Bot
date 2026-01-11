@@ -37,7 +37,7 @@ use tracing::{debug, error, info, warn};
 use crate::binance::{run_binance_ws, BinanceTick, PriceMove};
 use crate::config::{AppConfig, OperatingMode};
 use crate::polymarket::websocket::{run_polymarket_ws, OrderBookUpdate, PriceUpdate};
-use crate::polymarket::{PolymarketClient, MarketPrices};
+use crate::polymarket::{PolymarketClient, MarketPrices, Market};
 use crate::trading::TradingEngine;
 use crate::utils::{init_logging, PnlTracker, RebateTracker, SimulationEngine};
 
@@ -190,10 +190,26 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
     if markets.is_empty() {
         warn!("No active 15-min crypto markets found. Will retry...");
     } else {
-        info!("Found {} active crypto markets:", markets.len());
-        for market in &markets {
-            info!("  - {} ({}) [{}]", market.title, market.condition_id, market.asset);
-        }
+        info!("Found {} active crypto markets", markets.len());
+        
+        // Convert CryptoMarket to Market for trading engine cache
+        let engine_markets: Vec<Market> = markets.iter().map(|cm| {
+            Market {
+                condition_id: cm.condition_id.clone(),
+                question_id: cm.condition_id.clone(), // Use same as condition_id
+                tokens: vec![],
+                slug: cm.slug.clone(),
+                question: cm.title.clone(),
+                end_date_iso: cm.end_time.clone(),
+                active: true,
+                closed: false,
+                accepting_orders: cm.accepting_orders,
+                clob_token_ids: vec![cm.yes_token_id.clone(), cm.no_token_id.clone()],
+            }
+        }).collect();
+        
+        // Update trading engine cache
+        trading_engine.update_market_cache(engine_markets).await;
     }
 
     // Collect token IDs for WebSocket subscriptions
@@ -287,6 +303,23 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
                             // Update state
                             markets = new_markets;
                             current_token_ids = new_token_ids;
+                            
+                            // Update trading engine cache
+                            let engine_markets: Vec<Market> = markets.iter().map(|cm| {
+                                Market {
+                                    condition_id: cm.condition_id.clone(),
+                                    question_id: cm.condition_id.clone(),
+                                    tokens: vec![],
+                                    slug: cm.slug.clone(),
+                                    question: cm.title.clone(),
+                                    end_date_iso: cm.end_time.clone(),
+                                    active: true,
+                                    closed: false,
+                                    accepting_orders: cm.accepting_orders,
+                                    clob_token_ids: vec![cm.yes_token_id.clone(), cm.no_token_id.clone()],
+                                }
+                            }).collect();
+                            trading_engine.update_market_cache(engine_markets).await;
                         } else {
                             debug!("No market changes detected.");
                         }
