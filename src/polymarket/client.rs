@@ -160,7 +160,15 @@ struct SignedOrder {
 impl PolymarketClient {
     /// Create a new Polymarket client
     pub fn new(config: Arc<AppConfig>) -> Result<Self> {
+        // Fake User-Agent to bypass Cloudflare
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::USER_AGENT, 
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".parse().unwrap()
+        );
+
         let http_client = Client::builder()
+            .default_headers(headers)
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("Failed to create HTTP client")?;
