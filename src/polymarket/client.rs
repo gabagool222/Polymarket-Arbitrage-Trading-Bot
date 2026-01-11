@@ -1143,13 +1143,7 @@ impl PolymarketClient {
                     { "name": "message", "type": "string" },
                 ]
             },
-                "ClobAuth": [
-                    { "name": "address", "type": "address" },
-                    { "name": "timestamp", "type": "string" },
-                    { "name": "nonce", "type": "uint256" },
-                    { "name": "message", "type": "string" },
-                ]
-            },
+
             "primaryType": "ClobAuth",
             "message": {
                 "address": wallet_address_checksum,
