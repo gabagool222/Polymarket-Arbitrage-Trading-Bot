@@ -1145,7 +1145,7 @@ impl PolymarketClient {
             },
             "primaryType": "ClobAuth",
             "message": {
-                "address": format!("{:?}", wallet_address),
+                "address": format!("{:#x}", wallet_address),
                 "timestamp": timestamp,
                 "nonce": nonce,
                 "message": msg_text
@@ -1159,14 +1159,21 @@ impl PolymarketClient {
             .context("Failed to sign Auth message")?;
         let sig_hex = format!("0x{}", hex::encode(signature.to_vec()));
 
-        // Call /auth/derive-api-key
+        // Call /auth/derive-api-key with Query Params + Headers
         let url = format!("{}/auth/derive-api-key", self.api_url());
+        
+        // Add query params
+        let url = reqwest::Url::parse_with_params(
+            &url,
+            &[("address", format!("{:#x}", wallet_address)), ("nonce", nonce.to_string())]
+        )?.to_string();
         
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("Poly-Signature", sig_hex.parse()?);
         headers.insert("Poly-Timestamp", timestamp.parse()?);
         headers.insert("Poly-Nonce", nonce.parse()?);
-        headers.insert("Poly-Address", format!("{:?}", wallet_address).parse()?);
+        headers.insert("Poly-Address", format!("{:#x}", wallet_address).parse()?);
+        headers.insert("Poly-Signature-Type", "0".parse()?); // Type 0 = EOA
 
         let response = self.http_client.get(&url)
             .headers(headers)
