@@ -37,6 +37,12 @@ per_trade_shares = 2.0
 # 0.99 = 1% edge (sering trigger, profit kecil per trade)
 min_profit_threshold = 0.95
 
+# Minimum sum of Yes+No prices to consider valid (anti-stale data protection)
+# 0.90 = Safe default (reject if sum < 0.90)
+# 0.85 = More aggressive (fewer rejections, but slightly higher risk of stale data)
+# Set lower ONLY if you understand the risk of trading on potentially stale prices
+min_price_sum = 0.90
+
 # Dump trigger: % price drop to initiate Leg 1 buy
 dump_trigger_pct = 0.15
 

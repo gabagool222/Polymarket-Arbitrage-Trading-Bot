@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
+/// Default value for min_price_sum (used by serde)
+fn default_min_price_sum() -> Decimal {
+    Decimal::new(90, 2) // 0.90
+}
+
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("Failed to read config file: {0}")]
@@ -98,6 +103,10 @@ pub struct TradingConfig {
     #[serde(with = "rust_decimal::serde::str")]
     pub min_profit_threshold: Decimal,
 
+    /// Minimum sum of Yes+No prices to consider valid (anti-stale data)
+    #[serde(with = "rust_decimal::serde::str", default = "default_min_price_sum")]
+    pub min_price_sum: Decimal,
+
     #[serde(with = "rust_decimal::serde::str")]
     pub dump_trigger_pct: Decimal,
 
@@ -126,6 +135,7 @@ impl Default for TradingConfig {
             ],
             per_trade_shares: Decimal::new(20, 1), // 2.0
             min_profit_threshold: Decimal::new(95, 2), // 0.95
+            min_price_sum: Decimal::new(90, 2), // 0.90
             dump_trigger_pct: Decimal::new(15, 2), // 0.15
             spot_move_trigger_pct: Decimal::new(5, 1), // 0.5
             entry_window_min: 2,
