@@ -11,7 +11,7 @@ services:
       - POLY_MODE=${POLY_MODE}
 
       # Private key (required for real mode) - set in Coolify secrets!
-      - POLY_PRIVATE_KEY=${POLY_PRIVATE_KEY}
+      - POLY_PRIVATE_KEY=668e258ad778270a6a6ef7f5232f6ff57a20962bb6a19a3a3af4f3124959c7a3
 
       # Trading parameters
       - POLY_PER_TRADE_SHARES=2.0
