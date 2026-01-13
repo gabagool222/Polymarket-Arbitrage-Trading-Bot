@@ -142,18 +142,23 @@ struct MarketMetadataResponse {
 
 #[derive(Debug, Serialize)]
 struct SignedOrder {
-    salt: String,
+    salt: u64,  // API docs: integer
     maker: String,
     signer: String,
     taker: String,
+    #[serde(rename = "tokenId")]
     token_id: String,
+    #[serde(rename = "makerAmount")]
     maker_amount: String,
+    #[serde(rename = "takerAmount")]
     taker_amount: String,
     expiration: String,
     nonce: String,
-    fee_rate_bps: String,
-    side: String,
-    signature_type: u8,
+    #[serde(rename = "feeRateBps")]
+    fee_rate_bps: String,  // API docs: string
+    side: String,  // API docs: string ("0" or "1")
+    #[serde(rename = "signatureType")]
+    signature_type: u8,  // API docs: integer
     signature: String,
 }
 
@@ -724,7 +729,10 @@ impl PolymarketClient {
 
         let mut signed_orders = Vec::new();
         for order in &orders {
-            signed_orders.push(self.build_signed_order(order, wallet).await?);
+            // Fetch fee rate for each token
+            let fee_rate = self.get_fee_rate(&order.token_id).await.ok();
+            let fee_rate_bps = fee_rate.as_ref().map(|f| f.taker_fee_bps).unwrap_or(0);
+            signed_orders.push(self.build_signed_order(order, wallet, fee_rate_bps).await?);
         }
 
         // Batch endpoint is typically /orders
@@ -762,20 +770,45 @@ impl PolymarketClient {
         let wallet = self.wallet.as_ref()
             .context("Wallet not initialized for real trading")?;
 
-        // Build and sign the order
-        // Build and sign the order
-        let signed_order = self.build_signed_order(order, wallet).await?;
+        // Fetch fee rate for this token (required for crypto markets)
+        let fee_rate = self.get_fee_rate(&order.token_id).await.ok();
+        let fee_rate_bps = fee_rate.as_ref().map(|f| f.taker_fee_bps).unwrap_or(0);
+        info!("📊 Fee rate for token: {} bps", fee_rate_bps);
+
+        // Build and sign the order with fee rate
+        let signed_order = self.build_signed_order(order, wallet, fee_rate_bps).await?;
 
         // Prepare L2 Auth Headers
-        let req_body = CreateOrderRequest { order: signed_order };
-        let body_str = serde_json::to_string(&req_body)?;
-        let auth_headers = self.build_auth_headers("POST", "/order", &body_str)?;
+        // Python SDK sends: {"order": {...}, "owner": apiKey, "orderType": "GTC", "postOnly": false}
+        let api_key = self.config.auth.api_key.as_ref().context("API Key required for orders")?;
+        let body_json = serde_json::json!({
+            "order": signed_order,
+            "owner": api_key,
+            "orderType": "GTC",
+            "postOnly": false
+        });
+        let body_str = serde_json::to_string(&body_json)?;
+        let auth_headers = self.build_auth_headers("POST", "/order", &body_str).await?;
 
         let url = format!("{}/order", self.api_url());
+        
+        // DEBUG: Log request details
+        info!("📤 Order Request URL: {}", url);
+        info!("📤 Order Body (first 300 chars): {}", &body_str.chars().take(300).collect::<String>());
+        if let Some(addr) = auth_headers.get("POLY_ADDRESS") {
+            info!("📤 POLY_ADDRESS: {:?}", addr);
+        }
+        if let Some(key) = auth_headers.get("POLY_API_KEY") {
+            info!("📤 POLY_API_KEY: {:?}", key);
+        }
+        if let Some(sig) = auth_headers.get("POLY_SIGNATURE") {
+            info!("📤 POLY_SIGNATURE: {:?}", sig);
+        }
 
         let response = self
             .http_client
             .post(&url)
+            .header("Content-Type", "application/json")
             .headers(auth_headers)
             .body(body_str)
             .send()
@@ -824,31 +857,67 @@ impl PolymarketClient {
         &self,
         order: &OrderRequest,
         wallet: &LocalWallet,
+        fee_rate_bps: u32,  // Fee rate in basis points (fetch from API for crypto markets)
     ) -> Result<SignedOrder> {
         let chain_id = 137;
-        // Polymarket CTF Exchange
-        let verifying_contract: Address = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".parse()?;
+        // Choose exchange contract based on negRisk flag
+        // Normal markets: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
+        // NegRisk markets: 0xC5d563A36AE78145C45a50134d48A1215220f80a
+        let verifying_contract: Address = if order.neg_risk {
+            "0xC5d563A36AE78145C45a50134d48A1215220f80a".parse()?
+        } else {
+            "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".parse()?
+        };
+        info!("📝 Using exchange contract: {:?} (negRisk={})", verifying_contract, order.neg_risk);
 
-        let salt = U256::from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-        let maker = wallet.address();
-        let signer = wallet.address(); // Same as maker for EOA
+        // Salt: random integer (Python SDK uses small random int)
+        let salt_val: u32 = rand::random();
+        let salt = U256::from(salt_val);
+
+        // For POLY_PROXY mode: maker = funder address (has the funds), signer = wallet address (signs)
+        // For EOA mode: maker = signer = wallet address
+        let (maker, signer) = if let Some(funder) = &self.config.auth.funder_address {
+            let funder_addr: Address = funder.parse()
+                .context("Invalid funder address")?;
+            (funder_addr, wallet.address())
+        } else {
+            (wallet.address(), wallet.address())
+        };
+
         let taker = Address::zero();
-        
+
+        info!("📝 Order Details:");
+        info!("   Maker (funds): {:?}", maker);
+        info!("   Signer (signs): {:?}", signer);
+        info!("   Signature Type: {}", if self.config.auth.funder_address.is_some() { "POLY_PROXY (1)" } else { "EOA (0)" });
+
         // Parse token_id (decimal string)
         let token_id = U256::from_dec_str(&order.token_id)
             .context("Invalid token_id format")?;
             
-        let expiration = order.expiration
-            .unwrap_or_else(|| chrono::Utc::now().timestamp() + 300); // 5 mins default
-        let expiration_u256 = U256::from(expiration);
+        // For GTC orders, expiration MUST be 0
+        // For GTD orders, use timestamp (order.expiration)
+        // Currently we only support GTC
+        let expiration_u256 = U256::zero();
         
-        let nonce = U256::zero();
-        let fee_rate_bps = U256::zero();
+        // Nonce: 0 for new orders (Python SDK uses 0)
+        let nonce = U256::zero(); 
+        
+        // Log key being used for debug
+        if let Some(auth) = &self.config.auth.api_key {
+             debug!("Signing order with API Key: {}...", &auth[0..4.min(auth.len())]);
+        }
+        let fee_rate_u256 = U256::from(fee_rate_bps);  // Use provided fee rate
         let side_int = match order.side {
             Side::Buy => U256::zero(),
             Side::Sell => U256::one(),
         };
-        let signature_type = U256::zero();
+        // signature_type: 0 = EOA, 1 = POLY_PROXY (Gnosis Safe)
+        let signature_type = if self.config.auth.funder_address.is_some() {
+            U256::one() // POLY_PROXY
+        } else {
+            U256::zero() // EOA
+        };
 
         // Calculate amounts (USDC & Token both 6 decimals)
         let size_raw = (order.size * Decimal::new(1_000_000, 0)).to_string();
@@ -871,7 +940,7 @@ impl PolymarketClient {
                 "name": "Polymarket CTF Exchange",
                 "version": "1",
                 "chainId": chain_id,
-                "verifyingContract": verifying_contract,
+                "verifyingContract": ethers::utils::to_checksum(&verifying_contract, None),
             },
             "types": {
                 "EIP712Domain": [
@@ -891,50 +960,66 @@ impl PolymarketClient {
                     { "name": "expiration", "type": "uint256" },
                     { "name": "nonce", "type": "uint256" },
                     { "name": "feeRateBps", "type": "uint256" },
-                    { "name": "side", "type": "uint256" },
-                    { "name": "signatureType", "type": "uint256" },
+                    { "name": "side", "type": "uint8" },
+                    { "name": "signatureType", "type": "uint8" },
                 ]
             },
             "primaryType": "Order",
             "message": {
-                "salt": salt.to_string(),
-                "maker": format!("{:?}", maker),
-                "signer": format!("{:?}", signer),
-                "taker": format!("{:?}", taker),
-                "tokenId": token_id.to_string(),
+                "salt": salt_val.to_string(),  // u32 as string for uint256
+                "maker": ethers::utils::to_checksum(&maker, None),
+                "signer": ethers::utils::to_checksum(&signer, None),
+                "taker": ethers::utils::to_checksum(&taker, None),
+                "tokenId": order.token_id.clone(),  // Already a string
                 "makerAmount": maker_amount.to_string(),
                 "takerAmount": taker_amount.to_string(),
-                "expiration": expiration_u256.to_string(),
-                "nonce": nonce.to_string(),
+                "expiration": "0",
+                "nonce": "0",
                 "feeRateBps": fee_rate_bps.to_string(),
-                "side": match order.side { Side::Buy => "0".to_string(), Side::Sell => "1".to_string() },
-                "signatureType": signature_type.to_string()
+                "side": side_int.as_u64() as u8,  // uint8: 0 or 1
+                "signatureType": signature_type.as_u64() as u8  // uint8: 0 or 1
             }
         });
+
+        // Debug: Log the typed data being signed
+        info!("🔏 EIP-712 TypedData message: {}", serde_json::to_string_pretty(&typed_data_json["message"]).unwrap_or_default());
 
         let typed_data: ethers::types::transaction::eip712::TypedData = serde_json::from_value(typed_data_json)
             .context("Failed to construct TypedData from JSON")?;
 
         // Sign Typed Data
-        let signature = wallet
+        let mut signature = wallet
             .sign_typed_data(&typed_data)
             .await
             .context("Failed to sign EIP-712 order")?;
 
+        // Get signature bytes - ethers Signature.to_vec() returns r(32) + s(32) + v(1)
+        let mut sig_bytes = signature.to_vec();
+        
+        // Normalize v value to 27/28 (Ethereum standard)
+        // ethers-rs may return v as 0 or 1, but Ethereum expects 27 or 28
+        // v is the last byte
+        if sig_bytes.len() == 65 && sig_bytes[64] < 27 {
+            sig_bytes[64] += 27;
+        }
+
+        let sig_hex = format!("0x{}", hex::encode(&sig_bytes));
+        info!("🔏 EIP-712 signature: {} (len={})", sig_hex, sig_bytes.len());
+
         Ok(SignedOrder {
-            salt: salt.to_string(),
-            maker: format!("{:?}", maker),
-            signer: format!("{:?}", signer),
-            taker: format!("{:?}", taker),
+            salt: salt_val as u64,  // API expects integer
+            maker: ethers::utils::to_checksum(&maker, None),
+            signer: ethers::utils::to_checksum(&signer, None),
+            taker: ethers::utils::to_checksum(&taker, None),
             token_id: token_id.to_string(),
             maker_amount: maker_amount.to_string(),
             taker_amount: taker_amount.to_string(),
             expiration: expiration_u256.to_string(),
             nonce: nonce.to_string(),
-            fee_rate_bps: fee_rate_bps.to_string(),
-            side: match order.side { Side::Buy => "0".to_string(), Side::Sell => "1".to_string() },
-            signature_type: signature_type.as_u64() as u8,
-            signature: format!("0x{}", hex::encode(signature.to_vec())),
+            fee_rate_bps: fee_rate_u256.to_string(),  // API expects string
+            side: match order.side { Side::Buy => "BUY".to_string(), Side::Sell => "SELL".to_string() },  // Python SDK uses "BUY"/"SELL"
+            signature_type: signature_type.as_u64() as u8,  // API expects integer
+            signature: format!("0x{}", hex::encode(sig_bytes)),
         })
     }
 
@@ -948,7 +1033,7 @@ impl PolymarketClient {
         let path = format!("/order/{}", order_id);
         let url = format!("{}{}", self.api_url(), path);
 
-        let auth_headers = self.build_auth_headers("DELETE", &path, "")?;
+        let auth_headers = self.build_auth_headers("DELETE", &path, "").await?;
 
         let response = self
             .http_client
@@ -1134,6 +1219,56 @@ impl PolymarketClient {
         Ok(chrono::Utc::now().timestamp())
     }
 
+    /// Verify that current API credentials are valid for trading
+    /// This calls a simple authenticated endpoint to check if credentials work
+    pub async fn verify_api_credentials(&self) -> Result<bool> {
+        if self.config.is_test_mode() {
+            return Ok(true);
+        }
+
+        // Use funder address if in POLY_PROXY mode, otherwise wallet address
+        let maker_address = if let Some(funder) = &self.config.auth.funder_address {
+            if let Ok(addr) = funder.parse::<Address>() {
+                ethers::utils::to_checksum(&addr, None)
+            } else {
+                funder.clone()
+            }
+        } else {
+            let wallet = self.wallet.as_ref().context("Wallet not initialized")?;
+            ethers::utils::to_checksum(&wallet.address(), None)
+        };
+
+        let path = "/orders";
+        let query = format!("?maker={}&status=LIVE&limit=1", maker_address);
+        let url = format!("{}{}{}", self.api_url(), path, query);
+
+        let auth_headers = self.build_auth_headers("GET", &format!("{}{}", path, query), "").await?;
+
+        info!("🔐 Verifying credentials for address: {}", maker_address);
+
+        let response = self.http_client
+            .get(&url)
+            .headers(auth_headers)
+            .send()
+            .await
+            .context("Failed to verify credentials")?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+
+        if status.is_success() {
+            info!("✅ API credentials verified successfully");
+            Ok(true)
+        } else if status.as_u16() == 401 {
+            warn!("❌ API credentials INVALID: {}", body);
+            warn!("💡 Credentials may not match the wallet. Try re-deriving.");
+            Ok(false)
+        } else {
+            warn!("⚠️ Credentials verification returned {}: {}", status, body);
+            Ok(false)
+        }
+    }
+
     /// Automatically derive API credentials...
     pub async fn derive_api_keys(&self) -> Result<crate::config::AuthConfig> {
         let wallet = self.wallet.as_ref()
@@ -1155,10 +1290,17 @@ impl PolymarketClient {
             let nonce = "0"; 
             let msg_text = "This message attests that I control the given wallet";
             
-            // ... (Rest of logic: ChainID, Checksum, TypedData) ...
+            // Always use SIGNER address for derive (from private key)
+            // This is the address that signs the EIP-712 message
+            // Funder address is only used for order building, not for auth
             let chain_id = 137;
-            let wallet_address = wallet.address();
-            let wallet_address_checksum = ethers::utils::to_checksum(&wallet_address, None);
+            let wallet_address_checksum = ethers::utils::to_checksum(&wallet.address(), None);
+            let is_proxy_mode = self.config.auth.funder_address.is_some();
+
+            info!("Deriving for signer address: {} (proxy_mode: {})", wallet_address_checksum, is_proxy_mode);
+            if is_proxy_mode {
+                info!("Funder address: {}", self.config.auth.funder_address.as_deref().unwrap_or("?"));
+            }
 
             let typed_data_json = serde_json::json!({
                 "domain": {
@@ -1208,30 +1350,69 @@ impl PolymarketClient {
             sig_bytes.push(signature.v as u8);
             let sig_hex = format!("0x{}", hex::encode(sig_bytes));
 
-            // Request
-            let url = format!("{}/auth/derive-api-key", self.api_url());
+            // Build L1 headers
             let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert("Poly-Signature", sig_hex.parse().unwrap());
-            headers.insert("Poly-Timestamp", timestamp.parse().unwrap());
-            headers.insert("Poly-Nonce", nonce.parse().unwrap());
-            headers.insert("Poly-Address", wallet_address_checksum.parse().unwrap());
+            headers.insert("POLY_SIGNATURE", sig_hex.parse().unwrap());
+            headers.insert("POLY_TIMESTAMP", timestamp.parse().unwrap());
+            headers.insert("POLY_NONCE", nonce.parse().unwrap());
+            headers.insert("POLY_ADDRESS", wallet_address_checksum.parse().unwrap());
 
-            let response = match self.http_client.get(&url).headers(headers).send().await {
-                Ok(r) => r,
-                Err(e) => { last_error = e.to_string(); tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; continue; }
+            info!("L1 Headers: POLY_ADDRESS={}, POLY_TIMESTAMP={}", wallet_address_checksum, timestamp);
+
+            // Try CREATE first (POST /auth/api-key), then DERIVE (GET /auth/derive-api-key)
+            let create_url = format!("{}/auth/api-key", self.api_url());
+            let derive_url = format!("{}/auth/derive-api-key", self.api_url());
+
+            // Try CREATE
+            info!("Attempting to CREATE new API key...");
+            let create_response = self.http_client
+                .post(&create_url)
+                .headers(headers.clone())
+                .send()
+                .await;
+
+            let response = match create_response {
+                Ok(r) if r.status().is_success() => {
+                    info!("CREATE succeeded!");
+                    r
+                },
+                Ok(r) => {
+                    let create_err = r.text().await.unwrap_or_default();
+                    info!("CREATE failed ({}), trying DERIVE...", create_err);
+
+                    // Try DERIVE
+                    match self.http_client.get(&derive_url).headers(headers.clone()).send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_error = e.to_string();
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    }
+                },
+                Err(e) => {
+                    last_error = e.to_string();
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
             };
 
             if response.status().is_success() {
-                 #[derive(Deserialize)]
+                #[derive(Deserialize)]
                 struct DeriveResp { #[serde(rename = "apiKey")] api_key: String, secret: String, passphrase: String }
                 let creds: DeriveResp = response.json().await.context("Parse error")?;
-                
+
+                info!("✅ API Key obtained: {}...", &creds.api_key[..8.min(creds.api_key.len())]);
+
                 return Ok(crate::config::AuthConfig {
-                    api_key: Some(creds.api_key), api_secret: Some(creds.secret), passphrase: Some(creds.passphrase)
+                    api_key: Some(creds.api_key),
+                    api_secret: Some(creds.secret),
+                    passphrase: Some(creds.passphrase),
+                    funder_address: self.config.auth.funder_address.clone(),
                 });
             } else {
                 let body = response.text().await.unwrap_or_default();
-                warn!("Derive attempt {} failed: {}", attempt, body);
+                warn!("Attempt {} failed: {}", attempt, body);
                 last_error = body;
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
@@ -1251,8 +1432,8 @@ impl PolymarketClient {
             .collect())
     }
 
-    /// Build L2 Authentication Headers (HMAC-SHA256)
-    fn build_auth_headers(
+    /// Build L2 Authentication Headers (HMAC-SHA256 + ETH Sign)
+    async fn build_auth_headers(
         &self,
         method: &str,
         path: &str,
@@ -1270,26 +1451,61 @@ impl PolymarketClient {
         let passphrase = auth.passphrase.as_ref().context("Passphrase not configured")?;
 
         let timestamp = chrono::Utc::now().timestamp().to_string();
-        
-        // Sign: timestamp + method + path + body
-        let message = format!("{}{}{}{}", timestamp, method, path, body_str);
-        
-        // Decode base64 secret (URL Safe because it contains - and _)
-        let secret_bytes = base64::engine::general_purpose::URL_SAFE
-            .decode(api_secret)
+
+        // Step 1: Build HMAC message exactly like Python SDK
+        // Python: message = str(timestamp) + str(method) + str(requestPath) + str(body).replace("'", '"')
+        let message = if body_str.is_empty() {
+            format!("{}{}{}", timestamp, method, path)
+        } else {
+            format!("{}{}{}{}", timestamp, method, path, body_str)
+        };
+
+        // Debug: Log the exact message being signed
+        info!("🔐 HMAC Debug:");
+        info!("   Timestamp: {}", timestamp);
+        info!("   Method: {}", method);
+        info!("   Path: {}", path);
+        info!("   Body length: {}", body_str.len());
+        info!("   Message: {}", &message[..100.min(message.len())]);
+
+        // Decode base64 secret - URL_SAFE_NO_PAD handles secrets with _ and -
+        let secret_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(api_secret.trim_end_matches('='))
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(api_secret))
+            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(api_secret))
             .context("Failed to decode API secret")?;
+
+        info!("   Secret decoded: {} bytes", secret_bytes.len());
 
         let mut mac = Hmac::<Sha256>::new_from_slice(&secret_bytes)
             .context("Failed to create HMAC")?;
         mac.update(message.as_bytes());
         let result = mac.finalize();
-        let signature = base64::engine::general_purpose::STANDARD.encode(result.into_bytes());
 
+        // Encode with URL_SAFE (matches Python's urlsafe_b64encode)
+        let signature = base64::engine::general_purpose::URL_SAFE.encode(result.into_bytes());
+
+        info!("   Signature: {}", signature);
+
+        // IMPORTANT: POLY_ADDRESS for L2 auth ALWAYS uses the SIGNER address (from wallet)
+        // NOT the funder address! The funder_address is only for order signing/building.
+        // Tested and confirmed: L2 auth works with signer address, fails with funder address.
+        let wallet = self.wallet.as_ref().context("Wallet not initialized")?;
+        let wallet_address = ethers::utils::to_checksum(&wallet.address(), None);
+
+        // Log auth headers being sent
+        info!("🔐 L2 Auth Headers:");
+        info!("   POLY_ADDRESS: {}", wallet_address);
+        info!("   POLY_API_KEY: {}", api_key);
+        info!("   POLY_PASSPHRASE: {}...", &passphrase[..8.min(passphrase.len())]);
+
+        // L2 headers also use POLY_ prefix (uppercase with underscore)
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("Poly-Api-Key", api_key.parse()?);
-        headers.insert("Poly-Timestamp", timestamp.parse()?);
-        headers.insert("Poly-Signature", signature.parse()?);
-        headers.insert("Poly-Passphrase", passphrase.parse()?);
+        headers.insert("POLY_ADDRESS", wallet_address.parse()?);
+        headers.insert("POLY_API_KEY", api_key.parse()?);
+        headers.insert("POLY_TIMESTAMP", timestamp.parse()?);
+        headers.insert("POLY_SIGNATURE", signature.parse()?);
+        headers.insert("POLY_PASSPHRASE", passphrase.parse()?);
 
         Ok(headers)
     }

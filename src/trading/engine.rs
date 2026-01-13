@@ -167,6 +167,7 @@ impl TradingEngine {
             size: adjusted_size,
             order_type: OrderType::GoodTilCancelled,
             expiration: None, // GTC = no expiration
+            neg_risk: false,  // Default to non-negRisk
         };
 
         let placed = self.client.place_order(&order_request).await?;
@@ -535,6 +536,7 @@ impl TradingEngine {
             size: signal.suggested_size,
             order_type: OrderType::GoodTilCancelled,
             expiration: None,
+            neg_risk: false,
         };
 
         // Log simulation or execute
@@ -611,6 +613,7 @@ impl TradingEngine {
             size: signal.suggested_size,
             order_type: OrderType::GoodTilCancelled,
             expiration: None,
+            neg_risk: false,
         };
 
         if self.config.is_test_mode() {
@@ -667,6 +670,7 @@ impl TradingEngine {
             size,
             order_type: OrderType::GoodTilCancelled,
             expiration: None,
+            neg_risk: false,
         };
 
         if self.config.is_test_mode() {
@@ -740,6 +744,7 @@ impl TradingEngine {
                             size,
                             order_type: OrderType::GoodTilCancelled,
                             expiration: None,
+            neg_risk: false,
                         };
 
                         match self.client.place_order(&order).await {

@@ -217,6 +217,8 @@ pub struct OrderRequest {
     pub order_type: OrderType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expiration: Option<i64>,
+    #[serde(default)]
+    pub neg_risk: bool,
 }
 
 /// Order type

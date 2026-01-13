@@ -276,6 +276,7 @@ pub struct AuthConfig {
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub passphrase: Option<String>,
+    pub funder_address: Option<String>, // For POLY_PROXY: the proxy wallet address
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -400,6 +401,9 @@ impl AppConfig {
         }
         if let Ok(passphrase) = std::env::var("POLY_PASSPHRASE") {
             self.auth.passphrase = Some(passphrase);
+        }
+        if let Ok(funder) = std::env::var("POLY_FUNDER_ADDRESS") {
+            self.auth.funder_address = Some(funder);
         }
     }
 

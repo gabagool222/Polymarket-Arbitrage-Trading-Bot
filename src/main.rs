@@ -100,27 +100,51 @@ async fn main() -> Result<()> {
             .unwrap_or(Decimal::new(20, 1));
     }
 
-    // Auto-derive L2 API Keys if missing in Real Mode
-    if config.is_real_mode() && config.auth.api_key.is_none() {
-        println!("🔑 API Keys missing in config. Attempting to auto-derive using Private Key...");
-        
-        let temp_config = Arc::new(config.clone());
-        match PolymarketClient::new(temp_config) {
-            Ok(temp_client) => {
-                match temp_client.derive_api_keys().await {
-                    Ok(creds) => {
-                        println!("✅ API Credentials Derived Successfully!");
-                        println!("ℹ️  API Key: {}", creds.api_key.as_deref().unwrap_or("?"));
-                        config.auth = creds;
-                    },
-                    Err(e) => {
-                        eprintln!("❌ FATAL: Failed to derive API keys: {}", e);
-                        eprintln!("⚠️  Cannot proceed in Real Mode without API Keys.");
-                        std::process::exit(1);
+    // Handle L2 API Keys in Real Mode
+    if config.is_real_mode() {
+        if config.auth.api_key.is_none() {
+            // No credentials provided - try to derive from private key
+            println!("🔑 API Keys missing. Attempting to derive from Private Key...");
+            let temp_config = Arc::new(config.clone());
+            match PolymarketClient::new(temp_config) {
+                Ok(temp_client) => {
+                    match temp_client.derive_api_keys().await {
+                        Ok(creds) => {
+                            println!("✅ API Credentials Derived Successfully!");
+                            println!("ℹ️  API Key: {}", creds.api_key.as_deref().unwrap_or("?"));
+                            println!("");
+                            println!("💡 TIP: Save these credentials to avoid re-deriving:");
+                            println!("   POLY_API_KEY={}", creds.api_key.as_deref().unwrap_or(""));
+                            println!("   POLY_API_SECRET={}", creds.api_secret.as_deref().unwrap_or(""));
+                            println!("   POLY_PASSPHRASE={}", creds.passphrase.as_deref().unwrap_or(""));
+                            println!("");
+                            config.auth = creds;
+                        },
+                        Err(e) => {
+                            eprintln!("❌ FATAL: Failed to derive API keys: {}", e);
+                            eprintln!("⚠️  Cannot proceed in Real Mode without valid API Keys.");
+                            eprintln!("");
+                            eprintln!("💡 For POLY_PROXY wallets (Magic Link), get credentials from:");
+                            eprintln!("   https://polymarket.com → Settings → API Keys");
+                            std::process::exit(1);
+                        }
                     }
+                },
+                Err(e) => {
+                    eprintln!("❌ Failed to create client: {}", e);
+                    std::process::exit(1);
                 }
-            },
-            Err(e) => eprintln!("❌ Failed to create client for derivation: {}", e),
+            }
+        } else {
+            // Credentials provided - trust them and proceed
+            println!("🔑 Using provided API credentials");
+            println!("   API Key: {}...", &config.auth.api_key.as_deref().unwrap_or("?")[..8]);
+            if config.auth.funder_address.is_some() {
+                println!("   Mode: POLY_PROXY (Magic Link wallet)");
+                println!("   Funder: {}", config.auth.funder_address.as_deref().unwrap_or("?"));
+            } else {
+                println!("   Mode: EOA (direct wallet)");
+            }
         }
     }
 

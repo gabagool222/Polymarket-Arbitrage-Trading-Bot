@@ -366,6 +366,7 @@ mod tests {
             size: Decimal::new(10, 0),  // 10 shares
             order_type: crate::polymarket::types::OrderType::GoodTilCancelled,
             expiration: None,
+            neg_risk: false,
         };
 
         let placed = engine.place_order(&order).await.unwrap();
