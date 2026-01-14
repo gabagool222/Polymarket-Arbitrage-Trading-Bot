@@ -645,10 +645,19 @@ impl TradingEngine {
         info!("✅ Leg 1 Placed: {} ({} {})", placed_leg1.id, signal.token_type, order.price);
 
         // Prepare Leg 2 immediately (Opposite side)
-        let (leg2_type, leg2_price) = match signal.token_type {
-            TokenType::Yes => (TokenType::No, signal.current_no), // Use current market price for leg 2
+        let (leg2_type, base_leg2_price) = match signal.token_type {
+            TokenType::Yes => (TokenType::No, signal.current_no),
             TokenType::No => (TokenType::Yes, signal.current_yes),
         };
+
+        // AGGRESSIVE HEDGING: Add $0.03 slippage to Leg 2 to guarantee fill
+        // This sacrificing ~3 cents of profit to avoid Naked Position risk.
+        let leg2_price = (base_leg2_price + Decimal::new(3, 2)).min(Decimal::new(99, 2));
+
+        info!(
+            "Atomic Hedge: Adjusting Leg 2 Price from {} -> {} (Aggressive +0.03)",
+            base_leg2_price, leg2_price
+        );
 
         // Ensure total cost < 1.0 (Arbitrage check)
         // Note: signal.suggested_price is Leg 1 price
