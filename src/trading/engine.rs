@@ -657,9 +657,16 @@ impl TradingEngine {
             TokenType::No => (TokenType::Yes, signal.current_yes),
         };
 
-        // Aggressive Pricing Calculation
-        // Cap at 0.99 to allow closing trade (even at small loss) rather than naked fail
-        let leg2_price = (base_leg2_price + Decimal::new(3, 2)).min(Decimal::new(99, 2));
+        // Aggressive Pricing Calculation (PSEUDO-MARKET ORDER)
+        // We increase slippage from 0.03 to 0.10 to survive massive volatility spikes.
+        // Even if we bid +0.10, the engine will still give us the BEST available price (e.g. +0.00).
+        // This is strictly a safety net to prevent "Unfilled Orders" during dumps/pumps.
+        let leg2_price = (base_leg2_price + Decimal::new(10, 2)).min(Decimal::new(99, 2));
+
+        info!(
+            "Atomic Hedge: Adjusting Leg 2 Price from {} -> {} (Ultra-Aggressive +0.10)",
+            base_leg2_price, leg2_price
+        );
 
         // Resolve Leg 2 Token ID NOW
         let raw_leg2_token_id = self.get_token_id(&signal.market_id, leg2_type).await?;
