@@ -4,10 +4,9 @@
 //! Uses real-time price data from Polymarket and Binance.
 
 use crate::config::AppConfig;
-use crate::polymarket::types::{MarketPrices, OrderRequest, Side, TokenType};
-use crate::trading::types::*;
+use crate::polymarket::types::{MarketPrices, OrderRequest, Side};
 use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,7 +104,7 @@ impl SimulationEngine {
         let mut filled_orders = Vec::new();
         let mut orders = self.orders.write().await;
 
-        for (order_id, order) in orders.iter_mut() {
+        for (_order_id, order) in orders.iter_mut() {
             if order.status == VirtualOrderStatus::Filled {
                 continue;
             }

@@ -1,69 +1,58 @@
 #!/usr/bin/env python3
 """
-Generate new API credentials using py-clob-client
+Generate new API credentials using py-clob-client.
+This will use the values defined in your .env file.
 """
+import os
+from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 
-# Private Key dari Polymarket Reveal (untuk wallet 0xe21Dc24...)
-PRIVATE_KEY = "0x3293ab6e732cd9ec0412d660c29e87d316bbeb674109116fdba7c0dad8672e62"
+# Load variables from .env
+load_dotenv()
 
-# Polymarket proxy/funder address
-FUNDER_ADDRESS = "0x9046BBDFAa366204836e66CF1d850a04a1d89541"
-
+PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "").strip()
+FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS", "").strip()
+SIG_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "2"))
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 
-print("=== Generate New Polymarket API Credentials ===")
-print()
-print(f"Using private key: {PRIVATE_KEY[:10]}...{PRIVATE_KEY[-6:]}")
-print(f"Funder address: {FUNDER_ADDRESS}")
-print()
+if not PRIVATE_KEY:
+    print("❌ Error: POLY_PRIVATE_KEY not found in .env")
+    exit(1)
 
-# Initialize client with signature_type=1 (POLY_PROXY)
-client = ClobClient(
-    host=HOST,
-    chain_id=CHAIN_ID,
-    key=PRIVATE_KEY,
-    signature_type=1,  # POLY_PROXY for Magic/Email wallets
-    funder=FUNDER_ADDRESS
-)
-
-print(f"Signer address: {client.get_address()}")
-print()
+print("=== Generate Polymarket API Credentials ===")
+print(f"Using PK: {PRIVATE_KEY[:10]}...{PRIVATE_KEY[-6:]}")
+print(f"Funder: {FUNDER_ADDRESS}")
+print(f"SigType: {SIG_TYPE}")
+print("-" * 40)
 
 try:
-    print("Attempting to create or derive API credentials...")
+    # Initialize client
+    client = ClobClient(
+        host=HOST,
+        chain_id=137,
+        key=PRIVATE_KEY,
+        signature_type=SIG_TYPE,
+        funder=FUNDER_ADDRESS if FUNDER_ADDRESS else None
+    )
+
+    print(f"Signer Address: {client.get_address()}")
+    print("Attempting to derive API credentials...")
+    
+    # This will either fetch existing or create new ones
     creds = client.create_or_derive_api_creds()
     
-    print()
-    print("✅ SUCCESS! New credentials generated:")
-    print(f"   API Key: {creds.api_key}")
-    print(f"   API Secret: {creds.api_secret}")
-    print(f"   API Passphrase: {creds.api_passphrase}")
-    print()
-    print("Copy these to docker-compose.yml:")
-    print(f"   POLY_API_KEY={creds.api_key}")
-    print(f"   POLY_API_SECRET={creds.api_secret}")
-    print(f"   POLY_PASSPHRASE={creds.api_passphrase}")
+    print("\n✅ SUCCESS! Copy these to your .env file:")
+    print("-" * 40)
+    print(f"POLY_API_KEY={creds.api_key}")
+    print(f"POLY_API_SECRET={creds.api_secret}")
+    print(f"POLY_PASSPHRASE={creds.api_passphrase}")
+    print("-" * 40)
     
 except Exception as e:
-    print(f"❌ FAILED: {e}")
-    print()
-    print("Try signature_type=0 (EOA) instead...")
-    
-    try:
-        client2 = ClobClient(
-            host=HOST,
-            chain_id=CHAIN_ID,
-            key=PRIVATE_KEY,
-            signature_type=0  # EOA
-        )
-        print(f"EOA Address: {client2.get_address()}")
-        creds = client2.create_or_derive_api_creds()
-        print()
-        print("✅ SUCCESS with EOA! Credentials:")
-        print(f"   API Key: {creds.api_key}")
-        print(f"   API Secret: {creds.api_secret}")
-        print(f"   API Passphrase: {creds.api_passphrase}")
-    except Exception as e2:
-        print(f"❌ EOA also failed: {e2}")
+    print(f"\n❌ FAILED: {e}")
+    print("\nTroubleshooting Tips:")
+    print("1. If using MetaMask, make sure POLY_SIGNATURE_TYPE=2")
+    print("2. If using Magic Link, make sure POLY_SIGNATURE_TYPE=1")
+    print("3. Ensure the Private Key is exactly 64 chars long (plus 0x)")
+    print("4. Ensure Funder Address is the Proxy Wallet in Polymarket Settings")

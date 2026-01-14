@@ -9,7 +9,7 @@
 use crate::config::AppConfig;
 use crate::polymarket::types::{Fill, RebateEstimate};
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -289,7 +289,7 @@ pub fn should_prioritize_for_rebates(
         return false;
     }
 
-    let volume = price * size;
+    let _volume = price * size;
     let base_rate = Decimal::new(156, 4); // 1.56%
     let price_factor = Decimal::new(4, 0) * price * (Decimal::ONE - price);
     let effective_rate = base_rate * price_factor;

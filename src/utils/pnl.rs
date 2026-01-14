@@ -1,17 +1,15 @@
 //! PNL (Profit and Loss) tracking
 
 use crate::config::AppConfig;
-use crate::trading::types::{DailyStats, HedgeTrade, HedgeStatus};
+use crate::trading::types::{HedgeTrade, HedgeStatus};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 /// PNL record for a single trade

@@ -8,5 +8,5 @@ pub mod strategy;
 pub mod types;
 
 pub use engine::TradingEngine;
-pub use strategy::{HedgingStrategy, LatencyStrategy, StrategyManager};
+pub use strategy::StrategyManager;
 pub use types::*;

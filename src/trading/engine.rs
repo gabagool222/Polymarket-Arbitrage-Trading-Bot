@@ -14,7 +14,7 @@ use chrono::{Duration, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// Trading engine state
@@ -93,12 +93,22 @@ impl TradingEngine {
             .unwrap_or((Decimal::new(5, 0), Decimal::new(1, 2))); // Default: min 5 shares, tick 0.01
 
         // 2. Validate and adjust size
-        let adjusted_size = if size < min_size {
-            warn!(
-                "Size {} below min {}. Adjusting to min.",
-                size, min_size
-            );
+        // Polymarket CLOB requires a minimum total value of $1.00 USD (size * price >= 1.0)
+        let min_value = Decimal::ONE;
+        let min_size_for_value = (min_value / price).ceil();
+        
+        let effective_min_size = if min_size > min_size_for_value {
             min_size
+        } else {
+            min_size_for_value
+        };
+
+        let adjusted_size = if size < effective_min_size {
+            warn!(
+                "Size {} below effective min {} (to meet $1.00 min value). Adjusting.",
+                size, effective_min_size
+            );
+            effective_min_size
         } else {
             size
         };
@@ -521,12 +531,27 @@ impl TradingEngine {
         }
 
         // Resolve token ID from signal or fallback
-        let token_id = if let Some(id) = &signal.token_id {
-            id.clone()
+        // CLOB API REQUIRES the decimal string of the Token ID (e.g. "8419..."), not hex ("0xabc...")
+        let mut token_id = if let Some(id) = &signal.token_id {
+            if id.starts_with("0x") && id.len() < 30 { // Likely a Market ID/Condition ID
+                debug!("Signal provided hex Market ID {}, resolving to Token ID", id);
+                self.get_token_id(&signal.market_id, signal.token_type).await?
+            } else {
+                id.clone()
+            }
         } else {
-            warn!("Signal missing token_id, using fallback");
+            warn!("Signal missing token_id, resolving from market {}", signal.market_id);
             self.get_token_id(&signal.market_id, signal.token_type).await?
         };
+
+        // FINAL SAFETY: If token_id is still hex (0x...), convert it to decimal string
+        if token_id.starts_with("0x") {
+            if let Ok(val) = ethers::types::U256::from_str_radix(&token_id.trim_start_matches("0x"), 16) {
+                let dec_token = val.to_string();
+                debug!("Converted hex token {} to decimal {}", token_id, dec_token);
+                token_id = dec_token;
+            }
+        }
 
         // Create order request
         let order = OrderRequest {

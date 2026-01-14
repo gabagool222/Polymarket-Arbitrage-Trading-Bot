@@ -761,76 +761,86 @@ impl PolymarketClient {
         Ok(orders_response)
     }
 
-    /// Place a limit order (real mode only)
+    /// Place a limit order (real mode only) - Uses Python SDK for signing
     pub async fn place_order(&self, order: &OrderRequest) -> Result<Order> {
         if self.config.is_test_mode() {
             return self.simulate_order(order);
         }
 
-        let wallet = self.wallet.as_ref()
-            .context("Wallet not initialized for real trading")?;
-
-        // Fetch fee rate for this token (required for crypto markets)
-        let fee_rate = self.get_fee_rate(&order.token_id).await.ok();
-        let fee_rate_bps = fee_rate.as_ref().map(|f| f.taker_fee_bps).unwrap_or(0);
-        info!("📊 Fee rate for token: {} bps", fee_rate_bps);
-
-        // Build and sign the order with fee rate
-        let signed_order = self.build_signed_order(order, wallet, fee_rate_bps).await?;
-
-        // Prepare L2 Auth Headers
-        // Python SDK sends: {"order": {...}, "owner": apiKey, "orderType": "GTC", "postOnly": false}
-        let api_key = self.config.auth.api_key.as_ref().context("API Key required for orders")?;
-        let body_json = serde_json::json!({
-            "order": signed_order,
-            "owner": api_key,
-            "orderType": "GTC",
-            "postOnly": false
-        });
-        let body_str = serde_json::to_string(&body_json)?;
-        let auth_headers = self.build_auth_headers("POST", "/order", &body_str).await?;
-
-        let url = format!("{}/order", self.api_url());
+        // Use Python SDK for order signing and placement
+        info!("🐍 Using Python SDK for order placement...");
         
-        // DEBUG: Log request details
-        info!("📤 Order Request URL: {}", url);
-        info!("📤 Order Body (first 300 chars): {}", &body_str.chars().take(300).collect::<String>());
-        if let Some(addr) = auth_headers.get("POLY_ADDRESS") {
-            info!("📤 POLY_ADDRESS: {:?}", addr);
+        let side_str = match order.side {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        };
+
+        // Call Python script with inherited and explicit environment variables
+        let mut command = std::process::Command::new("/app/venv/bin/python3");
+        command.arg("/app/scripts/sign_order.py")
+            .arg(&order.token_id)
+            .arg(side_str)
+            .arg(order.price.to_string())
+            .arg(order.size.to_string())
+            .arg(if order.neg_risk { "true" } else { "false" });
+            
+        // Explicitly pass sensitive environment variables from Config/Env
+        if let Ok(pk) = std::env::var("POLY_PRIVATE_KEY") {
+            command.env("POLY_PRIVATE_KEY", pk);
         }
-        if let Some(key) = auth_headers.get("POLY_API_KEY") {
-            info!("📤 POLY_API_KEY: {:?}", key);
+        if let Some(fa) = &self.config.auth.funder_address {
+            command.env("POLY_FUNDER_ADDRESS", fa);
         }
-        if let Some(sig) = auth_headers.get("POLY_SIGNATURE") {
-            info!("📤 POLY_SIGNATURE: {:?}", sig);
+        if let Some(ak) = &self.config.auth.api_key {
+            command.env("POLY_API_KEY", ak);
         }
-
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .headers(auth_headers)
-            .body(body_str)
-            .send()
-            .await
-            .context("Failed to place order")?;
-
-        let status = response.status();
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            anyhow::bail!("Order placement failed {}: {}", status, body);
+        if let Some(as_key) = &self.config.auth.api_secret {
+            command.env("POLY_API_SECRET", as_key);
+        }
+        if let Some(ap) = &self.config.auth.passphrase {
+            command.env("POLY_PASSPHRASE", ap);
         }
 
-        let order_response: Order = serde_json::from_str(&body)
-            .context("Failed to parse order response")?;
+        let output = command.output()
+            .context("Failed to execute Python signing script")?;
 
-        info!(
-            "Order placed: {} {} {} @ {}",
-            order.side, order.size, order.token_id, order.price
-        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-        Ok(order_response)
+        if !stderr.is_empty() {
+            warn!("Python script stderr: {}", stderr);
+        }
+
+        info!("🐍 Python SDK response: {}", stdout);
+
+        // Parse response
+        let response: serde_json::Value = serde_json::from_str(&stdout)
+            .context(format!("Failed to parse Python response: {}", stdout))?;
+
+        if response.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let order_id = response.get("order_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            info!("✅ Order placed via Python SDK: {}", order_id);
+
+            Ok(Order {
+                id: order_id,
+                status: OrderStatus::Live,
+                token_id: order.token_id.clone(),
+                side: order.side,
+                original_size: order.size,
+                size_matched: Decimal::ZERO,
+                price: order.price,
+                created_at: chrono::Utc::now(),
+            })
+        } else {
+            let error = response.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
+            anyhow::bail!("Python SDK error: {}", error);
+        }
     }
 
     /// Simulate an order (test mode)
@@ -872,7 +882,7 @@ impl PolymarketClient {
 
         // Salt: random integer (Python SDK uses small random int)
         let salt_val: u32 = rand::random();
-        let salt = U256::from(salt_val);
+        let _salt = U256::from(salt_val);
 
         // For POLY_PROXY mode: maker = funder address (has the funds), signer = wallet address (signs)
         // For EOA mode: maker = signer = wallet address
@@ -976,8 +986,8 @@ impl PolymarketClient {
                 "expiration": "0",
                 "nonce": "0",
                 "feeRateBps": fee_rate_bps.to_string(),
-                "side": side_int.as_u64() as u8,  // uint8: 0 or 1
-                "signatureType": signature_type.as_u64() as u8  // uint8: 0 or 1
+                "side": side_int.as_u64() as u8,  // uint8 as integer
+                "signatureType": signature_type.as_u64() as u8  // uint8 as integer
             }
         });
 
@@ -988,7 +998,7 @@ impl PolymarketClient {
             .context("Failed to construct TypedData from JSON")?;
 
         // Sign Typed Data
-        let mut signature = wallet
+        let signature = wallet
             .sign_typed_data(&typed_data)
             .await
             .context("Failed to sign EIP-712 order")?;
@@ -1147,8 +1157,9 @@ impl PolymarketClient {
         let wallet = self.wallet.as_ref()
             .context("Wallet not initialized")?;
 
+        // Correctly format address (lowercase hex with 0x)
         let mut url = format!(
-            "{}/fills?maker={:?}",
+            "{}/data/fills?maker={:#x}", 
             self.api_url(),
             wallet.address()
         );
@@ -1157,12 +1168,37 @@ impl PolymarketClient {
             url.push_str(&format!("&market={}", market));
         }
 
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch fills")?;
+        // Add Auth Headers (Required for /fills)
+        let auth_headers = self.build_auth_headers("GET", "/data/fills", "")?;
+        
+        let mut request = self.http_client.get(&url);
+        
+        // Add L2 Auth headers
+        for (k, v) in auth_headers {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&v) {
+                 request = request.header(k, val);
+            }
+        }
+
+        // Add API Key headers
+        if let Some(api_key) = &self.config.auth.api_key {
+            request = request.header("POLY_API_KEY", api_key);
+        }
+        if let Some(passphrase) = &self.config.auth.passphrase {
+            request = request.header("POLY_PASSPHRASE", passphrase);
+        }
+
+        let response = request.send().await.context("Failed to fetch fills")?;
+
+        if response.status().as_u16() == 404 {
+             return Ok(Vec::new()); // Return empty if not found endpoint or empty data
+        }
+        
+        if !response.status().is_success() {
+             let text = response.text().await.unwrap_or_default();
+             warn!("Fills API Error {}: {}", response.status(), text);
+             return Ok(Vec::new());
+        }
 
         let status = response.status();
         let body = response.text().await?;

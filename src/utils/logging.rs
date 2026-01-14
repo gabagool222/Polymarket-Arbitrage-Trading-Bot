@@ -2,7 +2,7 @@
 
 use crate::config::AppConfig;
 use anyhow::Result;
-use std::sync::Arc;
+// use std::sync::Arc;
 use tracing::Level;
 use tracing_subscriber::{
     fmt::{self, format::FmtSpan},

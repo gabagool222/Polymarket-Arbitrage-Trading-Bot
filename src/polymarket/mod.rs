@@ -9,4 +9,4 @@ pub mod websocket;
 
 pub use client::PolymarketClient;
 pub use types::*;
-pub use websocket::{OrderBookUpdate, PolymarketWs, PriceUpdate};
+pub use websocket::PolymarketWs;
