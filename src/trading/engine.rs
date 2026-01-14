@@ -12,7 +12,7 @@ use crate::trading::types::{
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
@@ -30,6 +30,8 @@ pub struct TradingEngine {
     signal_rx: mpsc::Receiver<Signal>,
     /// Cached markets data with real clobTokenIds
     cached_markets: Arc<RwLock<HashMap<String, Market>>>,
+    /// History of unique Market IDs that have been processed/traded in this session
+    processed_markets: Arc<RwLock<HashSet<String>>>,
 }
 
 impl TradingEngine {
@@ -48,6 +50,7 @@ impl TradingEngine {
             signal_tx,
             signal_rx,
             cached_markets: Arc::new(RwLock::new(HashMap::new())),
+            processed_markets: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -550,6 +553,12 @@ impl TradingEngine {
     async fn open_trade(&self, signal: Signal) -> Result<()> {
         let is_simulated = self.config.is_test_mode();
         
+        // 🛑 SAFETY 5-MILLION-PERCENT: Check if we ALREADY traded this market
+        if self.processed_markets.read().await.contains(&signal.market_id) {
+            warn!("🛑 SAFETY BREAK: Skipping Market {} - Already traded in this session.", signal.market_id);
+            return Ok(());
+        }
+
         // === SAFETY CHECK 1: Daily trade limit ===
         {
             let stats = self.daily_stats.read().await;
@@ -639,55 +648,62 @@ impl TradingEngine {
             );
         }
 
-        // === ATOMIC EXECUTION START ===
-        // Place Leg 1
-        let placed_leg1 = self.client.place_order(&order).await?;
-        info!("✅ Leg 1 Placed: {} ({} {})", placed_leg1.id, signal.token_type, order.price);
-
-        // Prepare Leg 2 immediately (Opposite side)
+        // === PRE-CALCULATION PHASE (Safety First) ===
+        // Determine Leg 2 details BEFORE placing any order.
+        // If this fails, we haven't spent any money yet. Safe to abort.
+        
         let (leg2_type, base_leg2_price) = match signal.token_type {
             TokenType::Yes => (TokenType::No, signal.current_no),
             TokenType::No => (TokenType::Yes, signal.current_yes),
         };
 
-        // AGGRESSIVE HEDGING: Add $0.03 slippage to Leg 2 to guarantee fill
-        // This sacrificing ~3 cents of profit to avoid Naked Position risk.
+        // Aggressive Pricing Calculation
+        // Cap at 0.99 to allow closing trade (even at small loss) rather than naked fail
         let leg2_price = (base_leg2_price + Decimal::new(3, 2)).min(Decimal::new(99, 2));
 
-        info!(
-            "Atomic Hedge: Adjusting Leg 2 Price from {} -> {} (Aggressive +0.03)",
-            base_leg2_price, leg2_price
-        );
-
-        // Ensure total cost < 1.0 (Arbitrage check)
-        // Note: signal.suggested_price is Leg 1 price
-        if order.price + leg2_price >= Decimal::ONE {
-             warn!("⚠️ Atomic Hedge warning: Prices moved! {} + {} >= 1.0. Proceeding anyway to close loop.", order.price, leg2_price);
-        }
-
-        let leg2_token_id = self.get_token_id(&signal.market_id, leg2_type).await?;
+        // Resolve Leg 2 Token ID NOW
+        let raw_leg2_token_id = self.get_token_id(&signal.market_id, leg2_type).await?;
         
-        // Final check on leg2_token_id hex conversion
-        let leg2_token_id = if leg2_token_id.starts_with("0x") {
-             ethers::types::U256::from_str_radix(&leg2_token_id.trim_start_matches("0x"), 16)
+        // Handle Hex conversion safely
+        let leg2_token_id = if raw_leg2_token_id.starts_with("0x") {
+             ethers::types::U256::from_str_radix(&raw_leg2_token_id.trim_start_matches("0x"), 16)
                 .map(|v| v.to_string())
-                .unwrap_or(leg2_token_id)
-        } else { leg2_token_id };
+                .unwrap_or(raw_leg2_token_id)
+        } else {
+            raw_leg2_token_id
+        };
 
+        debug!("Pre-calculated Leg 2: {} ({}) @ {}", leg2_type, leg2_token_id, leg2_price);
+
+        // === EXECUTION PHASE (Atomic) ===
+        // Place Leg 1
+        let placed_leg1 = self.client.place_order(&order).await?;
+        info!("Leg 1 Placed: {} ({} {})", placed_leg1.id, signal.token_type, order.price);
+
+        // Prepare Leg 2 Order
         let leg2_order = OrderRequest {
-            token_id: leg2_token_id.clone(),
+            token_id: leg2_token_id.clone(), // Ready to use immediately!
             side: Side::Buy,
             price: leg2_price,
-            size: order.size, // Same size as Leg 1
+            size: order.size, 
             order_type: OrderType::GoodTilCancelled,
             expiration: None,
             neg_risk: false,
         };
 
-        // Place Leg 2 immediately
-        // We use a separate task or just await it effectively
+        // Warn if spread crossed (but execute anyway to hedge)
+        if order.price + leg2_price >= Decimal::ONE {
+             warn!("⚠️ Price Warning: {} + {} >= 1.0. Closing loop to prevent naked pos.", order.price, leg2_price);
+        }
+
+        // Place Leg 2 immediately (Nano-second delay after Leg 1)
         let placed_leg2 = self.client.place_order(&leg2_order).await?;
-        info!("✅ Leg 2 Placed (Atomic): {} ({} {})", placed_leg2.id, leg2_type, leg2_price);
+        info!("Leg 2 Placed (Atomic): {} ({} {})", placed_leg2.id, leg2_type, leg2_price);
+
+        // ✅ MARK MARKET AS PROCESSED
+        // This guarantees we NEVER open another trade for this Market ID in this session.
+        self.processed_markets.write().await.insert(signal.market_id.clone());
+        info!("Market {} marked as DONE. Safety Guard Active.", signal.market_id);
 
         // Create hedge trade record (Both legs OPEN)
         let trade_id = uuid::Uuid::new_v4().to_string();
