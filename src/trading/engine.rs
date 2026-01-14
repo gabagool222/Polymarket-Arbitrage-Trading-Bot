@@ -307,6 +307,73 @@ impl TradingEngine {
             return Ok(trade);
         }
 
+        // Parse expiry from market_id (e.g. "btc-updown-15m-1768403700")
+        let parts: Vec<&str> = market_id.split('-').collect();
+        if let Some(timestamp_str) = parts.last() {
+            if let Ok(expiry_ts) = timestamp_str.parse::<i64>() {
+                let now_ts = Utc::now().timestamp();
+                let time_left = expiry_ts - now_ts;
+                
+                // THETA PROTECTION: Don't trade if < 3 minutes (180s) left
+                if time_left < 180 {
+                    warn!("⏳ Theta Protection: Skipping trade, only {}s left for market {}", time_left, market_id);
+                    return Ok(HedgeTrade {
+                        id: format!("skipped_{}", uuid::Uuid::new_v4()),
+                        market_id: market_id.to_string(),
+                        asset: self.extract_asset(market_id),
+                        leg1: TradeLeg {
+                            order_id: None,
+                            token_id: leg1_token.to_string(),
+                            token_type: leg1_type,
+                            side: Side::Buy,
+                            price: leg1_price,
+                            size,
+                            filled_size: Decimal::ZERO,
+                            status: LegStatus::Skipped,
+                            filled_at: None,
+                        },
+                        leg2: None,
+                        status: HedgeStatus::Skipped,
+                        entry_reason: format!("Skipped due to theta protection: {}s left", time_left),
+                        created_at: Utc::now(),
+                        timeout_at: Utc::now(),
+                        closed_at: Some(Utc::now()),
+                        pnl: Some(Decimal::ZERO),
+                        is_simulated: false,
+                    });
+                }
+            }
+        }
+
+        // Check if we already have a trade for this market
+        if self.active_trades.read().await.values().any(|t| t.market_id == market_id) {
+            warn!("Skipping trade for market {} as an active trade already exists.", market_id);
+            return Ok(HedgeTrade {
+                id: format!("skipped_{}", uuid::Uuid::new_v4()),
+                market_id: market_id.to_string(),
+                asset: self.extract_asset(market_id),
+                leg1: TradeLeg {
+                    order_id: None,
+                    token_id: leg1_token.to_string(),
+                    token_type: leg1_type,
+                    side: Side::Buy,
+                    price: leg1_price,
+                    size,
+                    filled_size: Decimal::ZERO,
+                    status: LegStatus::Skipped,
+                    filled_at: None,
+                },
+                leg2: None,
+                status: HedgeStatus::Skipped,
+                entry_reason: "Skipped due to existing active trade".to_string(),
+                created_at: Utc::now(),
+                timeout_at: Utc::now(),
+                closed_at: Some(Utc::now()),
+                pnl: Some(Decimal::ZERO),
+                is_simulated: false,
+            });
+        }
+
         // Real mode: Create pending trade, wait for Leg1 fill
         let trade_id = uuid::Uuid::new_v4().to_string();
         let trade = HedgeTrade {
@@ -572,10 +639,48 @@ impl TradingEngine {
             );
         }
 
-        // Place order (client handles test mode internally)
-        let placed_order = self.client.place_order(&order).await?;
+        // === ATOMIC EXECUTION START ===
+        // Place Leg 1
+        let placed_leg1 = self.client.place_order(&order).await?;
+        info!("✅ Leg 1 Placed: {} ({} {})", placed_leg1.id, signal.token_type, order.price);
 
-        // Create hedge trade record
+        // Prepare Leg 2 immediately (Opposite side)
+        let (leg2_type, leg2_price) = match signal.token_type {
+            TokenType::Yes => (TokenType::No, signal.current_no), // Use current market price for leg 2
+            TokenType::No => (TokenType::Yes, signal.current_yes),
+        };
+
+        // Ensure total cost < 1.0 (Arbitrage check)
+        // Note: signal.suggested_price is Leg 1 price
+        if order.price + leg2_price >= Decimal::ONE {
+             warn!("⚠️ Atomic Hedge warning: Prices moved! {} + {} >= 1.0. Proceeding anyway to close loop.", order.price, leg2_price);
+        }
+
+        let leg2_token_id = self.get_token_id(&signal.market_id, leg2_type).await?;
+        
+        // Final check on leg2_token_id hex conversion
+        let leg2_token_id = if leg2_token_id.starts_with("0x") {
+             ethers::types::U256::from_str_radix(&leg2_token_id.trim_start_matches("0x"), 16)
+                .map(|v| v.to_string())
+                .unwrap_or(leg2_token_id)
+        } else { leg2_token_id };
+
+        let leg2_order = OrderRequest {
+            token_id: leg2_token_id.clone(),
+            side: Side::Buy,
+            price: leg2_price,
+            size: order.size, // Same size as Leg 1
+            order_type: OrderType::GoodTilCancelled,
+            expiration: None,
+            neg_risk: false,
+        };
+
+        // Place Leg 2 immediately
+        // We use a separate task or just await it effectively
+        let placed_leg2 = self.client.place_order(&leg2_order).await?;
+        info!("✅ Leg 2 Placed (Atomic): {} ({} {})", placed_leg2.id, leg2_type, leg2_price);
+
+        // Create hedge trade record (Both legs OPEN)
         let trade_id = uuid::Uuid::new_v4().to_string();
         let timeout_secs = self.config.trading.max_legs_timeout_sec as i64;
 
@@ -584,7 +689,7 @@ impl TradingEngine {
             market_id: signal.market_id.clone(),
             asset: self.extract_asset(&signal.market_id),
             leg1: TradeLeg {
-                order_id: Some(placed_order.id),
+                order_id: Some(placed_leg1.id),
                 token_id: order.token_id,
                 token_type: signal.token_type,
                 side: Side::Buy,
@@ -594,8 +699,18 @@ impl TradingEngine {
                 status: LegStatus::Open,
                 filled_at: None,
             },
-            leg2: None,
-            status: HedgeStatus::Leg1Pending,
+            leg2: Some(TradeLeg {
+                order_id: Some(placed_leg2.id),
+                token_id: leg2_token_id,
+                token_type: leg2_type,
+                side: Side::Buy,
+                price: leg2_price,
+                size: order.size,
+                filled_size: Decimal::ZERO,
+                status: LegStatus::Open,
+                filled_at: None,
+            }),
+            status: HedgeStatus::Leg2Pending, // Both pending fill
             entry_reason: signal.reason,
             created_at: Utc::now(),
             timeout_at: Utc::now() + Duration::seconds(timeout_secs),
@@ -611,12 +726,10 @@ impl TradingEngine {
             .insert(trade_id.clone(), trade);
 
         info!(
-            "Opened {} trade {}: {} {} @ {}",
-            signal.signal_type,
+            "Opened ATOMIC trade {}: {} {} + {} {}",
             trade_id,
-            signal.token_type,
-            signal.suggested_size,
-            signal.suggested_price
+            signal.token_type, signal.suggested_price,
+            leg2_type, leg2_price
         );
 
         Ok(())
@@ -760,60 +873,67 @@ impl TradingEngine {
                 }
 
                 // Check if Leg 1 filled and we need to place Leg 2
+                // ATOMIC UPDATE: We now place Leg 2 immediately. This block is practically unused unless we revert strategy.
                 if trade.status == HedgeStatus::Leg1Filled && trade.leg2.is_none() {
-                    if let Some((token_type, price, size)) = self.calculate_leg2(trade, prices) {
-                        let order = OrderRequest {
-                            token_id: self.get_token_id(&trade.market_id, token_type).await?,
-                            side: Side::Buy,
-                            price,
-                            size,
-                            order_type: OrderType::GoodTilCancelled,
-                            expiration: None,
-            neg_risk: false,
-                        };
+                     warn!("⚠️ Legacy Leg1Filled state detected for trade {}. Atomic strategy should have placed Leg 2 already.", trade_id);
+                     // Optional: Panic rescue or just log
+                }
 
-                        match self.client.place_order(&order).await {
-                            Ok(placed) => {
-                                trade.leg2 = Some(TradeLeg {
-                                    order_id: Some(placed.id),
-                                    token_id: order.token_id,
-                                    token_type,
-                                    side: Side::Buy,
-                                    price,
-                                    size,
-                                    filled_size: Decimal::ZERO,
-                                    status: LegStatus::Open,
-                                    filled_at: None,
-                                });
-                                trade.status = HedgeStatus::Leg2Pending;
-                                info!("Placed Leg 2 for trade {}", trade_id);
-                            }
-                            Err(e) => {
-                                error!("Failed to place Leg 2: {}", e);
+                // ATOMIC EXECUTION HANDLER
+                // In Atomic mode, status is Leg2Pending immediately. We must check fills for BOTH legs.
+                if trade.status == HedgeStatus::Leg2Pending {
+                    let mut leg1_done = trade.leg1.status == LegStatus::Filled;
+                    let mut leg2_done = false;
+
+                    // 1. Check Leg 1 (if not already filled)
+                    if !leg1_done {
+                         if self.check_leg_fill_status(trade, true).await {
+                             trade.leg1.status = LegStatus::Filled;
+                             trade.leg1.filled_size = trade.leg1.size;
+                             trade.leg1.filled_at = Some(now);
+                             info!("Atomic Trade {} Leg 1 FILLED", trade_id);
+                             leg1_done = true;
+                         }
+                    }
+
+                    // 2. Check Leg 2
+                    let leg2_already_filled = if let Some(ref leg2) = trade.leg2 {
+                        leg2.status == LegStatus::Filled
+                    } else {
+                        false
+                    };
+
+                    if leg2_already_filled {
+                        leg2_done = true;
+                    } else if trade.leg2.is_some() {
+                        // Not filled yet, check via API
+                        // This uses immutable borrow of `trade`
+                        let is_filled = self.check_leg_fill_status(trade, false).await;
+                        
+                        // If filled, NOW get mutable borrow to update
+                        if is_filled {
+                            if let Some(ref mut leg2) = trade.leg2 {
+                                leg2.status = LegStatus::Filled;
+                                leg2.filled_size = leg2.size;
+                                leg2.filled_at = Some(now);
+                                info!("Atomic Trade {} Leg 2 FILLED", trade_id);
+                                leg2_done = true;
                             }
                         }
                     }
-                }
 
-                // FIX: Check if Leg2 is filled (for pending Leg2 trades)
-                if trade.status == HedgeStatus::Leg2Pending && trade.leg2.is_some() {
-                    let leg2_filled = self.check_leg_fill_status(trade, false).await;
-
-                    if leg2_filled {
-                        if let Some(ref mut leg2) = trade.leg2 {
-                            leg2.status = LegStatus::Filled;
-                            leg2.filled_size = leg2.size;
-                            leg2.filled_at = Some(now);
-                        }
+                    // 3. If BOTH filled -> Complete
+                    if leg1_done && leg2_done {
                         trade.status = HedgeStatus::Complete;
                         trade.closed_at = Some(now);
 
-                        // Calculate PNL: guaranteed $1 payout - (leg1 cost + leg2 cost)
+                        // Calculate PNL
                         let leg1_cost = trade.leg1.price * trade.leg1.filled_size;
                         let leg2_cost = trade.leg2.as_ref()
-                            .map(|l| l.price * l.filled_size)
-                            .unwrap_or(Decimal::ZERO);
+                             .map(|l| l.price * l.filled_size)
+                             .unwrap_or(Decimal::ZERO);
                         let total_cost = leg1_cost + leg2_cost;
+
                         let payout = trade.leg1.filled_size.min(
                             trade.leg2.as_ref().map(|l| l.filled_size).unwrap_or(Decimal::ZERO)
                         );

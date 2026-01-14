@@ -7,7 +7,7 @@ use ethers::prelude::*;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::Sha256;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -124,42 +124,11 @@ struct OrderBookLevel {
     size: String,
 }
 
-#[derive(Debug, Serialize)]
-struct CreateOrderRequest {
-    order: SignedOrder,
-}
-
-#[derive(Debug, Serialize)]
-struct CreateOrdersRequest {
-    orders: Vec<SignedOrder>,
-}
-
+// CreateOrderRequest and SignedOrder removed
 #[derive(Debug, Deserialize)]
 struct MarketMetadataResponse {
-    minimum_order_size: String,
-    minimum_tick_size: String, // Note: API might call it tick_size or minimum_tick_size
-}
-
-#[derive(Debug, Serialize)]
-struct SignedOrder {
-    salt: u64,  // API docs: integer
-    maker: String,
-    signer: String,
-    taker: String,
-    #[serde(rename = "tokenId")]
-    token_id: String,
-    #[serde(rename = "makerAmount")]
-    maker_amount: String,
-    #[serde(rename = "takerAmount")]
-    taker_amount: String,
-    expiration: String,
-    nonce: String,
-    #[serde(rename = "feeRateBps")]
-    fee_rate_bps: String,  // API docs: string
-    side: String,  // API docs: string ("0" or "1")
-    #[serde(rename = "signatureType")]
-    signature_type: u8,  // API docs: integer
-    signature: String,
+     minimum_order_size: String,
+     minimum_tick_size: String,
 }
 
 impl PolymarketClient {
@@ -172,11 +141,20 @@ impl PolymarketClient {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".parse().unwrap()
         );
 
-        let http_client = Client::builder()
+        let mut client_builder = Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("Failed to create HTTP client")?;
+            .timeout(std::time::Duration::from_secs(30));
+
+        // PROXY SUPPORT
+        if let Ok(proxy_url) = std::env::var("POLY_PROXY") {
+            if !proxy_url.is_empty() {
+                info!("Running behind Proxy: {}...", proxy_url.chars().take(15).collect::<String>());
+                let proxy = reqwest::Proxy::all(&proxy_url).context("Failed to configure proxy")?;
+                client_builder = client_builder.proxy(proxy);
+            }
+        }
+
+        let http_client = client_builder.build().context("Failed to create HTTP client")?;
 
         // Initialize wallet if private key is available
         let wallet = if config.is_real_mode() {
@@ -714,52 +692,7 @@ impl PolymarketClient {
         Ok((min_size, tick_size))
     }
 
-    /// Place multiple orders in a batch (atomic-like)
-    pub async fn place_orders(&self, orders: Vec<OrderRequest>) -> Result<Vec<Order>> {
-        if self.config.is_test_mode() {
-            let mut simulated = Vec::new();
-            for order in orders {
-                simulated.push(self.simulate_order(&order)?);
-            }
-            return Ok(simulated);
-        }
-
-        let wallet = self.wallet.as_ref()
-            .context("Wallet not initialized for real trading")?;
-
-        let mut signed_orders = Vec::new();
-        for order in &orders {
-            // Fetch fee rate for each token
-            let fee_rate = self.get_fee_rate(&order.token_id).await.ok();
-            let fee_rate_bps = fee_rate.as_ref().map(|f| f.taker_fee_bps).unwrap_or(0);
-            signed_orders.push(self.build_signed_order(order, wallet, fee_rate_bps).await?);
-        }
-
-        // Batch endpoint is typically /orders
-        let url = format!("{}/orders", self.api_url());
-
-        let response = self
-            .http_client
-            .post(&url)
-            .json(&CreateOrdersRequest { orders: signed_orders })
-            .send()
-            .await
-            .context("Failed to place batch orders")?;
-
-        let status = response.status();
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            anyhow::bail!("Batch order failed {}: {}", status, body);
-        }
-
-        // Parse list of orders
-        let orders_response: Vec<Order> = serde_json::from_str(&body)
-            .context("Failed to parse batch order response")?;
-
-        info!("Batch orders placed successfully: {} orders", orders_response.len());
-        Ok(orders_response)
-    }
+    // place_orders (batch) removed - unused and outdated
 
     /// Place a limit order (real mode only) - Uses Python SDK for signing
     pub async fn place_order(&self, order: &OrderRequest) -> Result<Order> {
@@ -768,7 +701,8 @@ impl PolymarketClient {
         }
 
         // Use Python SDK for order signing and placement
-        info!("🐍 Using Python SDK for order placement...");
+        // Use Python SDK for order signing and placement
+        info!("Using Python SDK for order placement...");
         
         let side_str = match order.side {
             Side::Buy => "BUY",
@@ -801,6 +735,14 @@ impl PolymarketClient {
             command.env("POLY_PASSPHRASE", ap);
         }
 
+        // PROXY SUPPORT FOR PYTHON
+        if let Ok(proxy_url) = std::env::var("POLY_PROXY") {
+            if !proxy_url.is_empty() {
+                command.env("HTTPS_PROXY", &proxy_url);
+                command.env("HTTP_PROXY", &proxy_url);
+            }
+        }
+
         let output = command.output()
             .context("Failed to execute Python signing script")?;
 
@@ -811,7 +753,7 @@ impl PolymarketClient {
             warn!("Python script stderr: {}", stderr);
         }
 
-        info!("🐍 Python SDK response: {}", stdout);
+        info!("Python SDK response: {}", stdout);
 
         // Parse response
         let response: serde_json::Value = serde_json::from_str(&stdout)
@@ -823,7 +765,7 @@ impl PolymarketClient {
                 .unwrap_or("")
                 .to_string();
 
-            info!("✅ Order placed via Python SDK: {}", order_id);
+            info!("Order placed via Python SDK: {}", order_id);
 
             Ok(Order {
                 id: order_id,
@@ -862,176 +804,7 @@ impl PolymarketClient {
         })
     }
 
-    /// Build a signed order using EIP-712
-    async fn build_signed_order(
-        &self,
-        order: &OrderRequest,
-        wallet: &LocalWallet,
-        fee_rate_bps: u32,  // Fee rate in basis points (fetch from API for crypto markets)
-    ) -> Result<SignedOrder> {
-        let chain_id = 137;
-        // Choose exchange contract based on negRisk flag
-        // Normal markets: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
-        // NegRisk markets: 0xC5d563A36AE78145C45a50134d48A1215220f80a
-        let verifying_contract: Address = if order.neg_risk {
-            "0xC5d563A36AE78145C45a50134d48A1215220f80a".parse()?
-        } else {
-            "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".parse()?
-        };
-        info!("📝 Using exchange contract: {:?} (negRisk={})", verifying_contract, order.neg_risk);
-
-        // Salt: random integer (Python SDK uses small random int)
-        let salt_val: u32 = rand::random();
-        let _salt = U256::from(salt_val);
-
-        // For POLY_PROXY mode: maker = funder address (has the funds), signer = wallet address (signs)
-        // For EOA mode: maker = signer = wallet address
-        let (maker, signer) = if let Some(funder) = &self.config.auth.funder_address {
-            let funder_addr: Address = funder.parse()
-                .context("Invalid funder address")?;
-            (funder_addr, wallet.address())
-        } else {
-            (wallet.address(), wallet.address())
-        };
-
-        let taker = Address::zero();
-
-        info!("📝 Order Details:");
-        info!("   Maker (funds): {:?}", maker);
-        info!("   Signer (signs): {:?}", signer);
-        info!("   Signature Type: {}", if self.config.auth.funder_address.is_some() { "POLY_PROXY (1)" } else { "EOA (0)" });
-
-        // Parse token_id (decimal string)
-        let token_id = U256::from_dec_str(&order.token_id)
-            .context("Invalid token_id format")?;
-            
-        // For GTC orders, expiration MUST be 0
-        // For GTD orders, use timestamp (order.expiration)
-        // Currently we only support GTC
-        let expiration_u256 = U256::zero();
-        
-        // Nonce: 0 for new orders (Python SDK uses 0)
-        let nonce = U256::zero(); 
-        
-        // Log key being used for debug
-        if let Some(auth) = &self.config.auth.api_key {
-             debug!("Signing order with API Key: {}...", &auth[0..4.min(auth.len())]);
-        }
-        let fee_rate_u256 = U256::from(fee_rate_bps);  // Use provided fee rate
-        let side_int = match order.side {
-            Side::Buy => U256::zero(),
-            Side::Sell => U256::one(),
-        };
-        // signature_type: 0 = EOA, 1 = POLY_PROXY (Gnosis Safe)
-        let signature_type = if self.config.auth.funder_address.is_some() {
-            U256::one() // POLY_PROXY
-        } else {
-            U256::zero() // EOA
-        };
-
-        // Calculate amounts (USDC & Token both 6 decimals)
-        let size_raw = (order.size * Decimal::new(1_000_000, 0)).to_string();
-        let size_u256 = U256::from_dec_str(&size_raw).unwrap_or(U256::zero());
-        
-        let cost_raw = (order.size * order.price * Decimal::new(1_000_000, 0)).round().to_string();
-        let cost_u256 = U256::from_dec_str(&cost_raw).unwrap_or(U256::zero());
-
-        // Maker/Taker amounts rule:
-        // Buy: Maker=USDC (Cost), Taker=Tokens (Size)
-        // Sell: Maker=Tokens (Size), Taker=USDC (Cost)
-        let (maker_amount, taker_amount) = match order.side {
-            Side::Buy => (cost_u256, size_u256),
-            Side::Sell => (size_u256, cost_u256),
-        };
-
-        // Create TypedData via JSON to avoid struct import issues
-        let typed_data_json = serde_json::json!({
-            "domain": {
-                "name": "Polymarket CTF Exchange",
-                "version": "1",
-                "chainId": chain_id,
-                "verifyingContract": ethers::utils::to_checksum(&verifying_contract, None),
-            },
-            "types": {
-                "EIP712Domain": [
-                    { "name": "name", "type": "string" },
-                    { "name": "version", "type": "string" },
-                    { "name": "chainId", "type": "uint256" },
-                    { "name": "verifyingContract", "type": "address" },
-                ],
-                "Order": [
-                    { "name": "salt", "type": "uint256" },
-                    { "name": "maker", "type": "address" },
-                    { "name": "signer", "type": "address" },
-                    { "name": "taker", "type": "address" },
-                    { "name": "tokenId", "type": "uint256" },
-                    { "name": "makerAmount", "type": "uint256" },
-                    { "name": "takerAmount", "type": "uint256" },
-                    { "name": "expiration", "type": "uint256" },
-                    { "name": "nonce", "type": "uint256" },
-                    { "name": "feeRateBps", "type": "uint256" },
-                    { "name": "side", "type": "uint8" },
-                    { "name": "signatureType", "type": "uint8" },
-                ]
-            },
-            "primaryType": "Order",
-            "message": {
-                "salt": salt_val.to_string(),  // u32 as string for uint256
-                "maker": ethers::utils::to_checksum(&maker, None),
-                "signer": ethers::utils::to_checksum(&signer, None),
-                "taker": ethers::utils::to_checksum(&taker, None),
-                "tokenId": order.token_id.clone(),  // Already a string
-                "makerAmount": maker_amount.to_string(),
-                "takerAmount": taker_amount.to_string(),
-                "expiration": "0",
-                "nonce": "0",
-                "feeRateBps": fee_rate_bps.to_string(),
-                "side": side_int.as_u64() as u8,  // uint8 as integer
-                "signatureType": signature_type.as_u64() as u8  // uint8 as integer
-            }
-        });
-
-        // Debug: Log the typed data being signed
-        info!("🔏 EIP-712 TypedData message: {}", serde_json::to_string_pretty(&typed_data_json["message"]).unwrap_or_default());
-
-        let typed_data: ethers::types::transaction::eip712::TypedData = serde_json::from_value(typed_data_json)
-            .context("Failed to construct TypedData from JSON")?;
-
-        // Sign Typed Data
-        let signature = wallet
-            .sign_typed_data(&typed_data)
-            .await
-            .context("Failed to sign EIP-712 order")?;
-
-        // Get signature bytes - ethers Signature.to_vec() returns r(32) + s(32) + v(1)
-        let mut sig_bytes = signature.to_vec();
-        
-        // Normalize v value to 27/28 (Ethereum standard)
-        // ethers-rs may return v as 0 or 1, but Ethereum expects 27 or 28
-        // v is the last byte
-        if sig_bytes.len() == 65 && sig_bytes[64] < 27 {
-            sig_bytes[64] += 27;
-        }
-
-        let sig_hex = format!("0x{}", hex::encode(&sig_bytes));
-        info!("🔏 EIP-712 signature: {} (len={})", sig_hex, sig_bytes.len());
-
-        Ok(SignedOrder {
-            salt: salt_val as u64,  // API expects integer
-            maker: ethers::utils::to_checksum(&maker, None),
-            signer: ethers::utils::to_checksum(&signer, None),
-            taker: ethers::utils::to_checksum(&taker, None),
-            token_id: token_id.to_string(),
-            maker_amount: maker_amount.to_string(),
-            taker_amount: taker_amount.to_string(),
-            expiration: expiration_u256.to_string(),
-            nonce: nonce.to_string(),
-            fee_rate_bps: fee_rate_u256.to_string(),  // API expects string
-            side: match order.side { Side::Buy => "BUY".to_string(), Side::Sell => "SELL".to_string() },  // Python SDK uses "BUY"/"SELL"
-            signature_type: signature_type.as_u64() as u8,  // API expects integer
-            signature: format!("0x{}", hex::encode(sig_bytes)),
-        })
-    }
+    // build_signed_order removed (using Python SDK)
 
     /// Cancel an order
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
@@ -1169,13 +942,13 @@ impl PolymarketClient {
         }
 
         // Add Auth Headers (Required for /fills)
-        let auth_headers = self.build_auth_headers("GET", "/data/fills", "")?;
+        let auth_headers = self.build_auth_headers("GET", "/data/fills", "").await?;
         
         let mut request = self.http_client.get(&url);
         
         // Add L2 Auth headers
-        for (k, v) in auth_headers {
-            if let Ok(val) = reqwest::header::HeaderValue::from_str(&v) {
+        for (k, v) in &auth_headers {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(v.to_str().unwrap_or_default()) {
                  request = request.header(k, val);
             }
         }
@@ -1195,8 +968,9 @@ impl PolymarketClient {
         }
         
         if !response.status().is_success() {
+             let status = response.status();
              let text = response.text().await.unwrap_or_default();
-             warn!("Fills API Error {}: {}", response.status(), text);
+             warn!("Fills API Error {}: {}", status, text);
              return Ok(Vec::new());
         }
 
@@ -1280,7 +1054,7 @@ impl PolymarketClient {
 
         let auth_headers = self.build_auth_headers("GET", &format!("{}{}", path, query), "").await?;
 
-        info!("🔐 Verifying credentials for address: {}", maker_address);
+        info!("Verifying credentials for address: {}", maker_address);
 
         let response = self.http_client
             .get(&url)
@@ -1293,7 +1067,7 @@ impl PolymarketClient {
         let body = response.text().await.unwrap_or_default();
 
         if status.is_success() {
-            info!("✅ API credentials verified successfully");
+            info!("API credentials verified successfully");
             Ok(true)
         } else if status.as_u16() == 401 {
             warn!("❌ API credentials INVALID: {}", body);
@@ -1496,22 +1270,12 @@ impl PolymarketClient {
             format!("{}{}{}{}", timestamp, method, path, body_str)
         };
 
-        // Debug: Log the exact message being signed
-        info!("🔐 HMAC Debug:");
-        info!("   Timestamp: {}", timestamp);
-        info!("   Method: {}", method);
-        info!("   Path: {}", path);
-        info!("   Body length: {}", body_str.len());
-        info!("   Message: {}", &message[..100.min(message.len())]);
-
         // Decode base64 secret - URL_SAFE_NO_PAD handles secrets with _ and -
         let secret_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(api_secret.trim_end_matches('='))
             .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(api_secret))
             .or_else(|_| base64::engine::general_purpose::STANDARD.decode(api_secret))
             .context("Failed to decode API secret")?;
-
-        info!("   Secret decoded: {} bytes", secret_bytes.len());
 
         let mut mac = Hmac::<Sha256>::new_from_slice(&secret_bytes)
             .context("Failed to create HMAC")?;
@@ -1521,8 +1285,6 @@ impl PolymarketClient {
         // Encode with URL_SAFE (matches Python's urlsafe_b64encode)
         let signature = base64::engine::general_purpose::URL_SAFE.encode(result.into_bytes());
 
-        info!("   Signature: {}", signature);
-
         // IMPORTANT: POLY_ADDRESS for L2 auth ALWAYS uses the SIGNER address (from wallet)
         // NOT the funder address! The funder_address is only for order signing/building.
         // Tested and confirmed: L2 auth works with signer address, fails with funder address.
@@ -1530,10 +1292,10 @@ impl PolymarketClient {
         let wallet_address = ethers::utils::to_checksum(&wallet.address(), None);
 
         // Log auth headers being sent
-        info!("🔐 L2 Auth Headers:");
-        info!("   POLY_ADDRESS: {}", wallet_address);
-        info!("   POLY_API_KEY: {}", api_key);
-        info!("   POLY_PASSPHRASE: {}...", &passphrase[..8.min(passphrase.len())]);
+        // info!("🔐 L2 Auth Headers:");
+        // info!("   POLY_ADDRESS: {}", wallet_address);
+        // info!("   POLY_API_KEY: {}", api_key);
+        // info!("   POLY_PASSPHRASE: {}...", &passphrase[..8.min(passphrase.len())]);
 
         // L2 headers also use POLY_ prefix (uppercase with underscore)
         let mut headers = reqwest::header::HeaderMap::new();

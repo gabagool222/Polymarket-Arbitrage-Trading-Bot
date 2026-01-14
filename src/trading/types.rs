@@ -17,6 +17,8 @@ pub struct Signal {
     pub confidence: Decimal,
     pub reason: String,
     pub timestamp: DateTime<Utc>,
+    pub current_yes: Decimal, // Added for atomic exec
+    pub current_no: Decimal,  // Added for atomic exec
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,27 +90,22 @@ pub enum LegStatus {
     Filled,
     Cancelled,
     Failed,
+    Skipped, // Added
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HedgeStatus {
-    /// Leg 1 order placed, waiting for fill
     Leg1Pending,
-    /// Leg 1 filled, waiting to place Leg 2
     Leg1Filled,
-    /// Leg 2 order placed, waiting for fill
     Leg2Pending,
-    /// Both legs filled - complete hedge
     Complete,
-    /// Hedge closed with profit
-    ClosedProfit,
-    /// Hedge closed with loss
-    ClosedLoss,
-    /// Timed out before completion
     TimedOut,
-    /// Manually cancelled
     Cancelled,
+    Skipped,
+    ClosedProfit,
+    ClosedLoss,
 }
+
 
 impl std::fmt::Display for HedgeStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -121,6 +118,7 @@ impl std::fmt::Display for HedgeStatus {
             HedgeStatus::ClosedLoss => write!(f, "CLOSED_LOSS"),
             HedgeStatus::TimedOut => write!(f, "TIMED_OUT"),
             HedgeStatus::Cancelled => write!(f, "CANCELLED"),
+            HedgeStatus::Skipped => write!(f, "SKIPPED"),
         }
     }
 }

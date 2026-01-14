@@ -3,8 +3,6 @@ services:
     build: .
     container_name: polyarb-bot
     restart: unless-stopped
-
-    # Load environment variables from .env file
     env_file:
       - .env
 
@@ -14,10 +12,6 @@ services:
       - ./pnl.log:/app/pnl.log
       - ./rebates.log:/app/rebates.log
       - ./trades.log:/app/trades.log
-
-    # Optional: expose for monitoring dashboard
-    # ports:
-    #   - "8080:8080"
 
     logging:
       driver: "json-file"

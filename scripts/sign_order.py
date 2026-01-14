@@ -40,7 +40,7 @@ def main():
         try:
             old_id = token_id
             token_id = str(int(token_id, 16))
-            print(f"DEBUG: Converted hex TokenID {old_id} to decimal {token_id}", file=sys.stderr)
+            # print(f"DEBUG: Converted hex TokenID {old_id} to decimal {token_id}", file=sys.stderr)
         except Exception as e:
             print(json.dumps({"success": False, "error": f"Failed to convert hex token_id: {e}"}))
             sys.exit(1)
@@ -67,7 +67,7 @@ def main():
         )
 
         # THEN print debug info
-        print(f"DEBUG: Using Signer={client.get_address()}, Funder={funder_address}, SigType={sig_type}", file=sys.stderr)
+        # print(f"DEBUG: Using Signer={client.get_address()}, Funder={funder_address}, SigType={sig_type}", file=sys.stderr)
 
         # 1. Verify API Connectivity
         try:
@@ -89,7 +89,7 @@ def main():
         price_aligned = round(round(price / tick_f) * tick_f, 8)
         
         if price != price_aligned:
-             print(f"DEBUG: Aligned price {price} -> {price_aligned} (tick: {tick_size})", file=sys.stderr)
+             pass # print(f"DEBUG: Aligned price {price} -> {price_aligned} (tick: {tick_size})", file=sys.stderr)
 
         # 4. Get fee rate
         try:

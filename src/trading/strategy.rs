@@ -98,6 +98,8 @@ impl HedgingStrategy {
                 sum, edge, token_type
             ),
             timestamp: chrono::Utc::now(),
+            current_yes: prices.yes_price,
+            current_no: prices.no_price,
         })
     }
 
@@ -176,6 +178,8 @@ impl HedgingStrategy {
                 confidence: (drop_pct / dump_trigger).min(Decimal::ONE),
                 reason: format!("Avg down: {:.2}% drop, new price {}", drop_pct, current_price),
                 timestamp: chrono::Utc::now(),
+                current_yes: Decimal::ZERO,
+                current_no: Decimal::ZERO,
             });
         }
 
@@ -268,6 +272,8 @@ impl LatencyStrategy {
                 price_move.symbol, price_move.change_pct, expected_winner, current_price
             ),
             timestamp: chrono::Utc::now(),
+            current_yes: Decimal::ZERO,
+            current_no: Decimal::ZERO,
         })
     }
 }
