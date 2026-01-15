@@ -35,7 +35,7 @@ per_trade_shares = 2.0
 # 0.95 = 5% edge (ketat, jarang trigger)
 # 0.98 = 2% edge (lebih sering trigger)
 # 0.99 = 1% edge (sering trigger, profit kecil per trade)
-min_profit_threshold = 0.95
+min_profit_threshold = 0.92
 
 # Minimum sum of Yes+No prices to consider valid (anti-stale data protection)
 # 0.90 = Safe default (reject if sum < 0.90)
