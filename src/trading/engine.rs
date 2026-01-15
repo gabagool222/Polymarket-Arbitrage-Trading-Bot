@@ -1725,25 +1725,22 @@ impl TradingEngine {
                 // Try to get market expiry to determine strategy
                 let cache_guard = self.cached_markets.read().await;
                 if let Some(market) = cache_guard.get(&trade.market_id) {
-                    if let Ok(end_time) = chrono::DateTime::parse_from_rfc3339(&market.end_time) {
-                        let time_left = end_time.with_timezone(&Utc) - Utc::now();
-                        let seconds_left = time_left.num_seconds();
+                    if let Some(ref iso) = market.end_date_iso {
+                        if let Ok(end_time) = chrono::DateTime::parse_from_rfc3339(iso) {
+                            let time_left = end_time.with_timezone(&Utc) - Utc::now();
+                            let seconds_left = time_left.num_seconds();
 
-                        if seconds_left > 300 {
-                            // More than 5 mins left: Try slightly smarter sell
-                            // Aim for Midpoint ($0.50) - 0.05 = $0.45 or at least better than $0.01
-                            // Since we don't have realtime midpoint here easily without fetching book,
-                            // we can try a conservative "Flash Sale" price like $0.40 or $0.10.
-                            // User asked: "midpoint - 0.05".
-                            // Without midpoint, let's assume worst case midpoint $0.50 -> sell at $0.45?
-                            // Or safer: $0.10 (still much better than $0.01).
-                            // Let's us $0.10 as "Panic Maker" floor.
-                            sell_price = Decimal::new(10, 2); 
-                            info!("🕒 Time Left {}s > 300s. Using 'Soft Panic' Price: ${}", seconds_left, sell_price);
-                        } else {
-                            // < 5 mins: HARD PANIC ($0.01)
-                            info!("🕒 Time Left {}s < 300s. Using 'Hard Panic' Price: ${}", seconds_left, sell_price);
+                            if seconds_left > 300 {
+                                // More than 5 mins left: Try slightly smarter sell
+                                sell_price = Decimal::new(10, 2); 
+                                info!("🕒 Time Left {}s > 300s. Using 'Soft Panic' Price: ${}", seconds_left, sell_price);
+                            } else {
+                                // < 5 mins: HARD PANIC ($0.01)
+                                info!("🕒 Time Left {}s < 300s. Using 'Hard Panic' Price: ${}", seconds_left, sell_price);
+                            }
                         }
+                    } else {
+                        warn!("Market {} has no end_date_iso. Defaulting to panic dump.", trade.market_id);
                     }
                 } else {
                     // Market not in cache? Default to panic.
