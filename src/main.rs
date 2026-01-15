@@ -21,6 +21,7 @@
 //! ```
 
 mod binance;
+mod bybit;
 mod config;
 mod polymarket;
 mod trading;
@@ -35,6 +36,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::binance::{run_binance_ws, BinanceTick, PriceMove};
+use crate::bybit::{LiquidationCascade, LiquidationEvent, run_bybit_liquidation_ws};
 use crate::config::{AppConfig, OperatingMode};
 use crate::polymarket::websocket::{run_polymarket_ws, OrderBookUpdate, PriceUpdate};
 use crate::polymarket::{PolymarketClient, MarketPrices, Market};
@@ -174,6 +176,10 @@ fn print_banner(config: &AppConfig, args: &Args) {
           if config.binance.enabled { "Enabled" } else { "Disabled" });
     info!("║  Maker Rebates: {}                                       ║",
           if config.maker_rebates.enabled { "Enabled" } else { "Disabled" });
+    info!("║  Bybit Liquidation: {}                                   ║",
+          if config.bybit_liquidation.enabled { "Enabled" } else { "Disabled" });
+    info!("║  Cicil Mode: {}                                           ║",
+          if config.trading.enable_cicil_mode { "Enabled" } else { "Disabled" });
     info!("║  Initial Balance: ${}                                 ║",
           args.initial_balance);
     info!("╚═══════════════════════════════════════════════════════════╝");
@@ -214,6 +220,10 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
     let (poly_book_tx, _poly_book_rx) = broadcast::channel::<OrderBookUpdate>(1000);
     let (binance_tick_tx, _binance_tick_rx) = broadcast::channel::<BinanceTick>(1000);
     let (binance_move_tx, mut binance_move_rx) = broadcast::channel::<PriceMove>(100);
+
+    // Bybit liquidation channels
+    let (cascade_tx, mut cascade_rx) = broadcast::channel::<LiquidationCascade>(100);
+    let (liq_event_tx, _liq_event_rx) = broadcast::channel::<LiquidationEvent>(1000);
 
     // Initialize Polymarket client
     let client = Arc::new(
@@ -311,6 +321,43 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
                 error!("Binance WebSocket error: {}", e);
             }
         });
+    }
+
+    // Spawn Bybit Liquidation WebSocket task (if enabled)
+    if config.bybit_liquidation.enabled {
+        let bybit_symbols = config.bybit_liquidation.symbols.clone();
+        let bybit_window = config.bybit_liquidation.cascade_window_sec;
+        let bybit_threshold = config.bybit_liquidation.cascade_threshold_usd;
+        let cascade_tx_clone = cascade_tx.clone();
+        let liq_event_tx_clone = liq_event_tx.clone();
+
+        tokio::spawn(async move {
+            info!("🔥 Starting Bybit Liquidation Stream for: {:?}", bybit_symbols);
+            if let Err(e) = run_bybit_liquidation_ws(
+                bybit_symbols,
+                bybit_window,
+                bybit_threshold,
+                cascade_tx_clone,
+                liq_event_tx_clone,
+            )
+            .await
+            {
+                error!("Bybit Liquidation WebSocket error: {}", e);
+            }
+        });
+    }
+
+    // Spawn Fill Monitor task (dedicated polling instead of per-update spam)
+    {
+        let engine_clone = Arc::clone(&trading_engine);
+        tokio::spawn(async move {
+            engine_clone.run_fill_monitor().await;
+        });
+    }
+
+    // Initial balance update
+    if let Err(e) = trading_engine.update_balance().await {
+        warn!("Initial balance fetch failed: {}", e);
     }
 
     info!("Bot started. Monitoring markets for opportunities...");
@@ -512,6 +559,36 @@ async fn run_bot(config: Arc<AppConfig>, initial_balance: f64) -> Result<()> {
                 );
 
                 last_binance_move = Some(price_move);
+            }
+
+            // Handle Bybit liquidation cascades
+            Ok(cascade) = cascade_rx.recv() => {
+                warn!(
+                    "🚨 LIQUIDATION CASCADE: {} {} ${:.0} ({} events in {}s)",
+                    cascade.symbol,
+                    cascade.direction,
+                    cascade.total_value_usd,
+                    cascade.event_count,
+                    cascade.window_seconds
+                );
+
+                // Update trading engine with cascade for dynamic threshold
+                trading_engine.set_latest_cascade(Some(cascade.clone())).await;
+
+                // Log suggested action
+                info!(
+                    "📈 Suggested action: {:?} (dynamic threshold: {})",
+                    cascade.suggested_action,
+                    config.bybit_liquidation.cascade_profit_threshold
+                );
+
+                // Clear cascade after 30 seconds (it's no longer "fresh")
+                let engine_clone = Arc::clone(&trading_engine);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    engine_clone.set_latest_cascade(None).await;
+                    debug!("Cascade signal expired");
+                });
             }
 
             // Periodic stats logging

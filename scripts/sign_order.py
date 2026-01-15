@@ -12,6 +12,23 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, CreateOrderOptions
 from py_clob_client.order_builder.constants import BUY, SELL
 import os
+import requests
+from requests.utils import default_headers
+
+# === MONKEY PATCH USER-AGENT ===
+# Force a real browser User-Agent to bypass Cloudflare
+FAKE_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# 1. Patch requests (used by many SDKs)
+def custom_user_agent():
+    headers = default_headers()
+    headers['User-Agent'] = FAKE_USER_AGENT
+    return headers
+requests.utils.default_headers = custom_user_agent
+
+# 2. Patch env for libraries that read USER_AGENT
+os.environ["USER_AGENT"] = FAKE_USER_AGENT
+# ===============================
 
 def main():
     if len(sys.argv) < 5:

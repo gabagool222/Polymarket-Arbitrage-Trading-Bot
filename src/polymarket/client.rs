@@ -864,6 +864,105 @@ impl PolymarketClient {
     }
 
     // =========================================================================
+    // Balance & Account Info
+    // =========================================================================
+
+    /// Get USDC balance for the trading wallet
+    /// Uses the CLOB API to get the current balance
+    pub async fn get_balance(&self) -> Result<Decimal> {
+        if self.config.is_test_mode() {
+            // In simulation mode, return a reasonable test balance
+            return Ok(Decimal::new(100, 0)); // $100 test balance
+        }
+
+        // Use funder address if in POLY_PROXY mode, otherwise wallet address
+        let address = if let Some(funder) = &self.config.auth.funder_address {
+            funder.clone()
+        } else {
+            let wallet = self.wallet.as_ref()
+                .context("Wallet not initialized")?;
+            format!("{:#x}", wallet.address())
+        };
+
+        // Call CLOB API for balance-allowance (Authenticated)
+        // Endpoint: GET /balance-allowance?asset_type=COLLATERAL
+        let path = "/balance-allowance";
+        let query = "?asset_type=COLLATERAL";
+        let url = format!("{}{}{}", self.api_url(), path, query);
+
+        debug!("Fetching balance allowance for: {}", address);
+
+        // Build L2 Auth Headers (Required for this endpoint)
+        let auth_headers = self.build_auth_headers("GET", &format!("{}{}", path, query), "").await
+            .unwrap_or_else(|e| {
+                warn!("Failed to build auth headers for balance: {}", e);
+                reqwest::header::HeaderMap::new()
+            });
+
+        let mut request = self.http_client.get(&url);
+        
+        // Add headers
+        for (k, v) in &auth_headers {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(v.to_str().unwrap_or_default()) {
+                 request = request.header(k, val);
+            }
+        }
+        
+        // Add API Key headers manually if not in auth_headers (build_auth_headers adds POLY_ prefix)
+        // But the endpoint usually expects standard headers OR poly headers. Let's use standard too if needed.
+        if let Some(api_key) = &self.config.auth.api_key {
+            request = request.header("POLY_API_KEY", api_key);
+        }
+        if let Some(passphrase) = &self.config.auth.passphrase {
+            request = request.header("POLY_PASSPHRASE", passphrase);
+        }
+
+        let response = request.send().await;
+
+        match response {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    // Response format: { "allowance": "...", "balance": "..." }
+                    #[derive(Deserialize)]
+                    struct BalanceAllowanceResponse {
+                        #[serde(default)]
+                        balance: String, // String decimal
+                    }
+
+                    let body = resp.text().await.unwrap_or_default();
+                    let balance_resp: Result<BalanceAllowanceResponse, _> = serde_json::from_str(&body);
+
+                    match balance_resp {
+                        Ok(b) => {
+                            let balance: Decimal = b.balance.parse().unwrap_or(Decimal::ZERO);
+                            debug!("Balance: ${}", balance);
+                            Ok(balance)
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse balance response: {} | body: {}", e, body);
+                            Ok(Decimal::ZERO)
+                        }
+                    }
+                } else {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    // Don't warn on 404/401 aggressively to avoid spam log, just debug
+                    if status.as_u16() == 404 || status.as_u16() == 401 {
+                         debug!("Balance API returned {}: {}", status, text);
+                    } else {
+                         warn!("Balance API returned {}: {}", status, text);
+                    }
+                    Ok(Decimal::ZERO)
+                }
+            }
+            Err(e) => {
+                warn!("Failed to fetch balance: {}", e);
+                Ok(Decimal::ZERO)
+            }
+        }
+    }
+
+    // =========================================================================
     // Maker Rebates Integration (Jan 2026 Program)
     // =========================================================================
 

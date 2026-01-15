@@ -28,19 +28,17 @@ chain_id = 137
 market_slugs = [] # Auto-filled by bot logic
 
 # Shares per trade (configurable: $1 = ~2 shares at $0.50, $100 = ~200 shares)
-# $1 trade = 2 shares @ $0.50 price
-per_trade_shares = 2.0
+# UPDATED: For cicil mode, this is MAX shares per complete hedge (will cicil 1 at a time)
+per_trade_shares = 3.0
 
 # Minimum value to trigger trade (if Yes_price + No_price < this)
-# 0.95 = 5% edge (ketat, jarang trigger)
-# 0.98 = 2% edge (lebih sering trigger)
-# 0.99 = 1% edge (sering trigger, profit kecil per trade)
-min_profit_threshold = 0.92
+# UPDATED from 0.92 to 0.98 - 2% edge is realistic and triggers more often
+# 0.98 = 2% edge (achievable in normal markets)
+# Dynamic: Lowered to 0.985-0.99 when liquidation cascade detected
+min_profit_threshold = 0.98
 
 # Minimum sum of Yes+No prices to consider valid (anti-stale data protection)
 # 0.90 = Safe default (reject if sum < 0.90)
-# 0.85 = More aggressive (fewer rejections, but slightly higher risk of stale data)
-# Set lower ONLY if you understand the risk of trading on potentially stale prices
 min_price_sum = 0.90
 
 # Dump trigger: % price drop to initiate Leg 1 buy
@@ -50,11 +48,12 @@ dump_trigger_pct = 0.15
 spot_move_trigger_pct = 0.5
 
 # Entry window: only trade within first N minutes of round
-# Set to 14 to allow trading almost entire round (disable restriction)
-entry_window_min = 14
+# UPDATED: 10 minutes gives enough time for fills before market resolves
+entry_window_min = 10
 
 # Max timeout for completing hedge (Leg 2) in seconds
-max_legs_timeout_sec = 60
+# UPDATED: 120s to allow maker orders to fill
+max_legs_timeout_sec = 120
 
 # Maximum daily risk as % of total capital
 max_daily_risk_pct = 20.0
@@ -63,14 +62,40 @@ max_daily_risk_pct = 20.0
 orderbook_depth = 5
 
 # Slippage tolerance for limit orders (basis points)
-slippage_bps = 50
+# UPDATED: 200 bps (2 cents) for maker orders - stay on book
+slippage_bps = 200
 
 # Retry attempts for failed orders
 max_order_retries = 3
 
 # Minimum edge required to place trade (in cents)
-# Set to 0 to allow any positive edge
-min_edge_cents = 0
+min_edge_cents = 1
+
+# === Leg 2 Pricing Strategy ===
+# Use MAKER price for Leg2 instead of $0.99 taker
+# Leg2 price = opposite_side_price + leg2_price_offset
+# This earns rebates instead of paying taker fees
+leg2_price_offset = 0.02
+
+# === Incremental Hedging (Cicil) ===
+# Enable incremental 1-share-at-a-time hedging
+enable_cicil_mode = true
+
+# Shares per cicil (usually 1)
+cicil_share_size = 1.0
+
+# Max cicil iterations before stopping
+max_cicil_count = 3
+
+# Seconds to wait between cicils for momentum confirmation
+cicil_wait_seconds = 15
+
+# === Balance Safety ===
+# Minimum USDC balance to maintain (don't trade below this)
+min_balance_usd = 10.0
+
+# Require balance check before each trade
+require_balance_check = true
 
 [binance_integration]
 # Enable Binance price streaming for latency arbitrage
@@ -89,14 +114,36 @@ ws_url = "wss://stream.binance.com:9443"
 reconnect_delay_ms = 1000
 max_reconnect_attempts = 10
 
+# === NEW: Bybit Liquidation Integration ===
+[bybit_liquidation]
+# Enable Bybit liquidation stream for cascade detection
+enabled = true
+
+# Symbols to monitor for liquidations (uppercase)
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+# Rolling window for cascade detection (seconds)
+cascade_window_sec = 10
+
+# Minimum total liquidated value to trigger cascade alert (USD)
+# $1M = significant cascade, $500k = moderate
+cascade_threshold_usd = 1000000.0
+
+# Dynamic threshold adjustment when cascade detected
+# If cascade detected, use this tighter threshold instead of min_profit_threshold
+cascade_profit_threshold = 0.985
+
+# Enable directional trading based on cascade (not just hedging)
+enable_directional_trades = false
+
 [risk_management]
 # Maximum position size per market (in shares)
-# With $318 capital, max ~60 shares per market ($30 exposure)
-max_position_per_market = 60.0
+# With $99 capital, max ~10 shares per market ($5-10 exposure with cicil)
+max_position_per_market = 10.0
 
 # Maximum total exposure across all markets
-# ~50% of capital = $159 max across all markets
-max_total_exposure = 320.0
+# ~30% of $99 capital = ~$30 max across all markets
+max_total_exposure = 30.0
 
 # Stop loss threshold (% of position value)
 stop_loss_pct = 10.0
@@ -110,11 +157,11 @@ max_consecutive_losses = 3
 # === REAL TRADING SAFETY LIMITS ===
 
 # Maximum trades per day (hard limit)
-max_trades_per_day = 100
+max_trades_per_day = 50
 
 # Circuit breaker: Stop all trading if daily loss exceeds this amount (in dollars)
-# Negative value, e.g., -50 means stop if we lose $50
-circuit_breaker_loss = -50.0
+# Negative value, e.g., -20 means stop if we lose $20 (from $99 capital)
+circuit_breaker_loss = -20.0
 
 [logging]
 # Log level: trace, debug, info, warn, error
@@ -160,3 +207,15 @@ market_making_max_position = 50.0
 
 # Quote refresh interval (milliseconds)
 quote_refresh_ms = 5000
+
+# === NEW: Fill Monitoring ===
+[fill_monitor]
+# Interval for polling /fills endpoint (seconds)
+# Reduced from every market update to dedicated interval
+poll_interval_sec = 5
+
+# Enable auto-rebalance on partial fills
+enable_auto_rebalance = true
+
+# Maximum imbalance (shares) before auto-selling excess
+max_imbalance_shares = 2.0

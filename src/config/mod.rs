@@ -13,6 +13,21 @@ fn default_min_price_sum() -> Decimal {
     Decimal::new(90, 2) // 0.90
 }
 
+/// Default leg2 price offset
+fn default_leg2_price_offset() -> Decimal {
+    Decimal::new(2, 2) // 0.02
+}
+
+/// Default cicil share size
+fn default_cicil_share_size() -> Decimal {
+    Decimal::ONE
+}
+
+/// Default min balance USD
+fn default_min_balance_usd() -> Decimal {
+    Decimal::new(10, 0) // $10
+}
+
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("Failed to read config file: {0}")]
@@ -123,7 +138,42 @@ pub struct TradingConfig {
     pub slippage_bps: u32,
     pub max_order_retries: u32,
     pub min_edge_cents: u32,
+
+    // === NEW: Leg 2 Maker Pricing ===
+    /// Price offset for Leg2 above market (to stay maker, not taker)
+    #[serde(with = "rust_decimal::serde::str", default = "default_leg2_price_offset")]
+    pub leg2_price_offset: Decimal,
+
+    // === NEW: Incremental Hedging (Cicil) ===
+    /// Enable incremental 1-share-at-a-time hedging
+    #[serde(default)]
+    pub enable_cicil_mode: bool,
+
+    /// Shares per cicil iteration
+    #[serde(with = "rust_decimal::serde::str", default = "default_cicil_share_size")]
+    pub cicil_share_size: Decimal,
+
+    /// Maximum cicil iterations
+    #[serde(default = "default_max_cicil_count")]
+    pub max_cicil_count: u32,
+
+    /// Seconds to wait between cicils
+    #[serde(default = "default_cicil_wait_seconds")]
+    pub cicil_wait_seconds: u32,
+
+    // === NEW: Balance Safety ===
+    /// Minimum USDC balance to maintain
+    #[serde(with = "rust_decimal::serde::str", default = "default_min_balance_usd")]
+    pub min_balance_usd: Decimal,
+
+    /// Require balance check before each trade
+    #[serde(default = "default_true")]
+    pub require_balance_check: bool,
 }
+
+fn default_max_cicil_count() -> u32 { 3 }
+fn default_cicil_wait_seconds() -> u32 { 15 }
+fn default_true() -> bool { true }
 
 impl Default for TradingConfig {
     fn default() -> Self {
@@ -133,18 +183,26 @@ impl Default for TradingConfig {
                 "will-eth-go-up-15-min".to_string(),
                 "will-sol-go-up-15-min".to_string(),
             ],
-            per_trade_shares: Decimal::new(20, 1), // 2.0
-            min_profit_threshold: Decimal::new(92, 2), // 0.92 (Strict Spread)
+            per_trade_shares: Decimal::new(30, 1), // 3.0 (max shares for cicil mode)
+            min_profit_threshold: Decimal::new(98, 2), // 0.98 (2% edge - realistic)
             min_price_sum: Decimal::new(90, 2), // 0.90
             dump_trigger_pct: Decimal::new(15, 2), // 0.15
             spot_move_trigger_pct: Decimal::new(5, 1), // 0.5
-            entry_window_min: 2,
-            max_legs_timeout_sec: 60,
+            entry_window_min: 10, // 10 min gives time for fills
+            max_legs_timeout_sec: 120, // 120s for maker fills
             max_daily_risk_pct: Decimal::new(200, 1), // 20.0
             orderbook_depth: 5,
-            slippage_bps: 50,
+            slippage_bps: 200, // 2 cents for maker
             max_order_retries: 3,
-            min_edge_cents: 2,
+            min_edge_cents: 1,
+            // New fields
+            leg2_price_offset: Decimal::new(2, 2), // +$0.02 (stay maker)
+            enable_cicil_mode: true,
+            cicil_share_size: Decimal::ONE,
+            max_cicil_count: 3,
+            cicil_wait_seconds: 15,
+            min_balance_usd: Decimal::new(10, 0), // $10 min
+            require_balance_check: true,
         }
     }
 }
@@ -172,6 +230,71 @@ impl Default for BinanceConfig {
             ws_url: "wss://stream.binance.com:9443".to_string(),
             reconnect_delay_ms: 1000,
             max_reconnect_attempts: 10,
+        }
+    }
+}
+
+/// Bybit liquidation configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BybitLiquidationConfig {
+    /// Enable Bybit liquidation stream
+    pub enabled: bool,
+
+    /// Symbols to monitor for liquidations (uppercase, e.g., "BTCUSDT")
+    pub symbols: Vec<String>,
+
+    /// Rolling window for cascade detection (seconds)
+    pub cascade_window_sec: u32,
+
+    /// Minimum total liquidated value to trigger cascade (USD)
+    #[serde(with = "rust_decimal::serde::str")]
+    pub cascade_threshold_usd: Decimal,
+
+    /// Dynamic threshold when cascade detected
+    #[serde(with = "rust_decimal::serde::str")]
+    pub cascade_profit_threshold: Decimal,
+
+    /// Enable directional trading based on cascade
+    pub enable_directional_trades: bool,
+}
+
+impl Default for BybitLiquidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            symbols: vec![
+                "BTCUSDT".to_string(),
+                "ETHUSDT".to_string(),
+                "SOLUSDT".to_string(),
+            ],
+            cascade_window_sec: 10,
+            cascade_threshold_usd: Decimal::new(1_000_000, 0), // $1M
+            cascade_profit_threshold: Decimal::new(985, 3), // 0.985
+            enable_directional_trades: false,
+        }
+    }
+}
+
+/// Fill monitor configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillMonitorConfig {
+    /// Polling interval for /fills endpoint (seconds)
+    pub poll_interval_sec: u32,
+
+    /// Enable auto-rebalance on partial fills
+    pub enable_auto_rebalance: bool,
+
+    /// Maximum imbalance (shares) before auto-selling
+    #[serde(with = "rust_decimal::serde::str")]
+    pub max_imbalance_shares: Decimal,
+}
+
+impl Default for FillMonitorConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_sec: 5,
+            enable_auto_rebalance: true,
+            max_imbalance_shares: Decimal::new(2, 0), // 2 shares
         }
     }
 }
@@ -296,6 +419,9 @@ pub struct AppConfig {
     #[serde(default, rename = "binance_integration")]
     pub binance: BinanceConfig,
 
+    #[serde(default)]
+    pub bybit_liquidation: BybitLiquidationConfig,
+
     #[serde(default, rename = "risk_management")]
     pub risk: RiskConfig,
 
@@ -304,6 +430,9 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub maker_rebates: MakerRebatesConfig,
+
+    #[serde(default)]
+    pub fill_monitor: FillMonitorConfig,
 }
 
 impl AppConfig {
@@ -390,6 +519,21 @@ impl AppConfig {
         // Market making enabled override
         if let Ok(enabled) = std::env::var("POLY_MARKET_MAKING_ENABLED") {
             self.maker_rebates.enable_market_making = enabled.to_lowercase() == "true" || enabled == "1";
+        }
+
+        // === Override Cicil Mode Params ===
+        if let Ok(enabled) = std::env::var("POLY_ENABLE_CICIL_MODE") {
+            self.trading.enable_cicil_mode = enabled.to_lowercase() == "true" || enabled == "1";
+        }
+        if let Ok(size) = std::env::var("POLY_CICIL_SHARE_SIZE") {
+             if let Ok(parsed) = size.parse::<Decimal>() {
+                self.trading.cicil_share_size = parsed;
+            }
+        }
+        if let Ok(wait) = std::env::var("POLY_CICIL_WAIT_SECONDS") {
+            if let Ok(parsed) = wait.parse::<u32>() {
+                self.trading.cicil_wait_seconds = parsed;
+            }
         }
 
         // L2 Auth Credentials

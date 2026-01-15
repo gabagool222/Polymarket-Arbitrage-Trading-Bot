@@ -1,8 +1,16 @@
 //! Trading engine - orchestrates strategies and execution
+//!
+//! Features:
+//! - Incremental hedging (cicil mode): 1 share at a time with momentum confirmation
+//! - Maker pricing for Leg2: earns rebates instead of paying taker fees
+//! - Partial fill handler: auto-rebalances imbalanced positions
+//! - Balance check before entry: prevents insufficient funds errors
+//! - Liquidation cascade integration: dynamic threshold based on market impulse
 
 use crate::binance::PriceMove;
+use crate::bybit::{LiquidationCascade, CascadeDirection, CascadeAction};
 use crate::config::AppConfig;
-use crate::polymarket::types::{Market, MarketPrices, OrderRequest, OrderType, Side, TokenType};
+use crate::polymarket::types::{Market, MarketPrices, Order, OrderRequest, OrderType, OrderStatus as PolyOrderStatus, Side, TokenType};
 use crate::polymarket::PolymarketClient;
 use crate::trading::strategy::StrategyManager;
 use crate::trading::types::{
@@ -14,7 +22,7 @@ use chrono::{Duration, Utc};
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// Trading engine state
@@ -32,6 +40,10 @@ pub struct TradingEngine {
     cached_markets: Arc<RwLock<HashMap<String, Market>>>,
     /// History of unique Market IDs that have been processed/traded in this session
     processed_markets: Arc<RwLock<HashSet<String>>>,
+    /// Current USDC balance (updated periodically)
+    cached_balance: Arc<RwLock<Decimal>>,
+    /// Latest liquidation cascade (if any) for dynamic threshold
+    latest_cascade: Arc<RwLock<Option<LiquidationCascade>>>,
 }
 
 impl TradingEngine {
@@ -51,7 +63,64 @@ impl TradingEngine {
             signal_rx,
             cached_markets: Arc::new(RwLock::new(HashMap::new())),
             processed_markets: Arc::new(RwLock::new(HashSet::new())),
+            cached_balance: Arc::new(RwLock::new(Decimal::ZERO)),
+            latest_cascade: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Update cached balance from API
+    pub async fn update_balance(&self) -> Result<Decimal> {
+        let balance = self.client.get_balance().await?;
+        *self.cached_balance.write().await = balance;
+        debug!("Balance updated: ${}", balance);
+        Ok(balance)
+    }
+
+    /// Get current cached balance
+    pub async fn get_balance(&self) -> Decimal {
+        *self.cached_balance.read().await
+    }
+
+    /// Update latest cascade for dynamic threshold
+    pub async fn set_latest_cascade(&self, cascade: Option<LiquidationCascade>) {
+        *self.latest_cascade.write().await = cascade;
+    }
+
+    /// Get dynamic threshold based on cascade presence
+    /// Returns tighter threshold (0.985) if cascade detected, else config default (0.98)
+    pub async fn get_dynamic_threshold(&self) -> Decimal {
+        let cascade = self.latest_cascade.read().await;
+        if cascade.is_some() {
+            // Cascade detected - use tighter threshold from config
+            self.config.bybit_liquidation.cascade_profit_threshold
+        } else {
+            // Normal mode - use standard threshold
+            self.config.trading.min_profit_threshold
+        }
+    }
+
+    /// Check if balance is sufficient for a trade
+    pub async fn check_balance_sufficient(&self, required: Decimal) -> Result<bool> {
+        if !self.config.trading.require_balance_check {
+            return Ok(true);
+        }
+
+        let balance = self.get_balance().await;
+        let min_balance = self.config.trading.min_balance_usd;
+
+        // Need: required amount + minimum reserve
+        let total_needed = required + min_balance;
+
+        if balance < total_needed {
+            warn!(
+                "💰 BALANCE CHECK FAILED: Need ${} (trade ${} + reserve ${}), have ${}",
+                total_needed, required, min_balance, balance
+            );
+            return Ok(false);
+        }
+
+        debug!("Balance OK: ${} >= ${} needed", balance, total_needed);
+        Ok(true)
     }
 
     /// Update cached markets with fresh data from API
@@ -606,6 +675,18 @@ impl TradingEngine {
             }
         }
 
+        // === INCREMENTAL TRADING (CICIL) CHECK ===
+        if self.config.trading.enable_cicil_mode {
+            // Cicil mode enabled - delegate to incremental engine
+            match self.execute_incremental_hedge(&signal).await {
+                Ok(Some(_trade)) => return Ok(()),
+                Ok(None) => return Ok(()), // Skipped or failed gracefull
+                Err(e) => return Err(e),
+            }
+        }
+
+        // ... otherwise proceed with ATOMIC TURBO EXECUTION (below) ...
+
         // Resolve token ID from signal or fallback
         // CLOB API REQUIRES the decimal string of the Token ID (e.g. "8419..."), not hex ("0xabc...")
         let mut token_id = if let Some(id) = &signal.token_id {
@@ -657,15 +738,28 @@ impl TradingEngine {
             TokenType::No => (TokenType::Yes, signal.current_yes),
         };
 
-        // Aggressive Pricing Calculation (SUICIDE SQUAD MODE)
-        // We set limit to 0.99 (Max Possible Price).
-        // This guarantees a fill at ANY market price available.
-        // Priority: NO NAKED POSITIONS EVER. Better to lose $0.01 on slippage than $3.00 on naked exposure.
-        let leg2_price = Decimal::new(99, 2);
+        // === MAKER PRICING MODE (EARN REBATES INSTEAD OF PAYING TAKER FEES) ===
+        // OLD: $0.99 taker price = 3.15% taker fee = destroys profit
+        // NEW: base_price + offset = maker order that earns 1.56% rebate
+        //
+        // SAFETY BALANCE:
+        // - If offset too small (0.01): might not fill if price moves fast → naked risk
+        // - If offset too large (0.10): crosses spread → becomes taker → fee
+        // - Sweet spot: +0.02 to +0.05 above current price → stays maker, fills reasonably fast
+        //
+        // NOTE: This trades some fill guarantee for better economics.
+        // For maximum safety (old behavior), set leg2_price_offset = 0.49 in config
+
+        let leg2_offset = self.config.trading.leg2_price_offset;
+        let leg2_price_raw = base_leg2_price + leg2_offset;
+
+        // Cap at 0.95 maximum to prevent crossing into deep taker territory
+        // This means worst case we pay slightly more but stay maker most of the time
+        let leg2_price = leg2_price_raw.min(Decimal::new(95, 2));
 
         info!(
-            "Atomic Hedge: Adjusting Leg 2 Price from {} -> {} (MAX LIMIT GUARANTEE)",
-            base_leg2_price, leg2_price
+            "📊 MAKER MODE: Leg 2 Price {} + {} offset = {} (capped at 0.95)",
+            base_leg2_price, leg2_offset, leg2_price
         );
 
         // Resolve Leg 2 Token ID NOW
@@ -1250,6 +1344,435 @@ impl TradingEngine {
         risk.cooldown_until = None;
 
         info!("Daily stats reset for {}", stats.date);
+    }
+
+    // =========================================================================
+    // INCREMENTAL HEDGING (CICIL MODE)
+    // =========================================================================
+
+    /// Execute incremental hedge with cicil (1 share at a time) and momentum confirmation
+    /// This is safer than firing all shares at once because:
+    /// 1. Smaller initial exposure if market moves against us
+    /// 2. Can abort mid-cicil if momentum reverses
+    /// 3. Better fill rates on smaller orders
+    pub async fn execute_incremental_hedge(
+        &self,
+        signal: &Signal,
+    ) -> Result<Option<HedgeTrade>> {
+        let is_simulated = self.config.is_test_mode();
+
+        // Safety checks
+        if self.processed_markets.read().await.contains(&signal.market_id) {
+            warn!("🛑 Market {} already traded, skipping cicil", signal.market_id);
+            return Ok(None);
+        }
+
+        let cicil_size = self.config.trading.cicil_share_size;
+        let max_cicil = self.config.trading.max_cicil_count;
+        let max_shares = self.config.trading.per_trade_shares;
+        let wait_secs = self.config.trading.cicil_wait_seconds;
+
+        // Calculate total cost for balance check
+        // Balance check removed by user request (assume sufficient funds/reserve)
+        // let estimated_cost = ... 
+
+
+        // Resolve token IDs
+        let leg1_token_id = self.get_token_id(&signal.market_id, signal.token_type).await?;
+        let leg2_type = match signal.token_type {
+            TokenType::Yes => TokenType::No,
+            TokenType::No => TokenType::Yes,
+        };
+        let leg2_token_id = self.get_token_id(&signal.market_id, leg2_type).await?;
+
+        info!("═══════════════════════════════════════════════════════════════");
+        info!("  🔄 INCREMENTAL HEDGE (CICIL MODE)");
+        info!("═══════════════════════════════════════════════════════════════");
+        info!("  Market: {}", signal.market_id);
+        info!("  Max Shares: {} | Cicil Size: {} | Max Cicils: {}", max_shares, cicil_size, max_cicil);
+        info!("  Wait between cicils: {}s", wait_secs);
+        info!("═══════════════════════════════════════════════════════════════");
+
+        let mut total_leg1_filled = Decimal::ZERO;
+        let mut total_leg2_filled = Decimal::ZERO;
+        let mut leg1_orders: Vec<String> = Vec::new();
+        let mut leg2_orders: Vec<String> = Vec::new();
+
+        for cicil_num in 1..=max_cicil {
+            if total_leg1_filled >= max_shares {
+                info!("Max shares reached, stopping cicil");
+                break;
+            }
+
+            let remaining = max_shares - total_leg1_filled;
+            let this_cicil = cicil_size.min(remaining);
+
+            // === CICIL LEG 1 ===
+            info!("📦 Cicil #{}: Placing Leg1 {} {} @ ${}",
+                cicil_num, signal.token_type, this_cicil, signal.suggested_price);
+
+            let leg1_order = OrderRequest {
+                token_id: leg1_token_id.clone(),
+                side: Side::Buy,
+                price: signal.suggested_price,
+                size: this_cicil,
+                order_type: OrderType::GoodTilCancelled,
+                expiration: None,
+                neg_risk: false,
+            };
+
+            let placed_leg1 = if is_simulated {
+                info!("[SIM] Would place Leg1 order");
+                Order {
+                    id: format!("sim_leg1_{}", uuid::Uuid::new_v4()),
+                    status: PolyOrderStatus::Live,
+                    token_id: leg1_token_id.clone(),
+                    side: Side::Buy,
+                    original_size: this_cicil,
+                    size_matched: this_cicil,
+                    price: signal.suggested_price,
+                    created_at: Utc::now(),
+                }
+            } else {
+                self.client.place_order(&leg1_order).await?
+            };
+            leg1_orders.push(placed_leg1.id.clone());
+            total_leg1_filled += this_cicil;
+
+            // === WAIT FOR MOMENTUM CONFIRMATION (Polling) ===
+            info!("⏳ Waiting {}s for momentum confirmation...", wait_secs);
+
+            // Polling logic: Check every 1s for new cascade in self.latest_cascade
+            let mut momentum_confirmed = false;
+            let check_interval = 2; // check every 2s
+            let iterations = wait_secs / check_interval;
+
+            for _ in 0..iterations {
+                tokio::time::sleep(std::time::Duration::from_secs(check_interval as u64)).await;
+                
+                let cascade_opt = self.latest_cascade.read().await;
+                if let Some(cascade) = cascade_opt.as_ref() {
+                    // Check validity duration (stale check)
+                    let now = Utc::now();
+                    if now - cascade.timestamp > chrono::Duration::seconds(30) {
+                         // Cascade stale
+                         continue;
+                    }
+
+                    momentum_confirmed = match (signal.token_type, cascade.suggested_action) {
+                        (TokenType::Yes, CascadeAction::BuyUp) => true,
+                        (TokenType::No, CascadeAction::BuyDown) => true,
+                        _ => false
+                    };
+                    
+                    if momentum_confirmed {
+                        info!("✅ CASCADE CONFIRMS MOMENTUM: {} ${:.0}",
+                            cascade.direction, cascade.total_value_usd);
+                        break; 
+                    }
+                }
+            }
+
+            info!("🚦 TRAFFIC LIGHT: {}", if momentum_confirmed { "🟢 HIJAU - Lanjut Cicil!" } else { "🟡 KUNING/MERAH - Hati-hati!" });
+
+            // If NO cascade detected, we assume neutral/safe to verify via other means or just proceed slowly
+            // If cascade AGAINST us, we break. But we only have `latest_cascade`.
+            // Let's rely on: If not explicitly confirmed and we are > 1 cicil, proceed unless dangerous?
+            // Actually, "cicil_wait_seconds" is primarily for spacing orders.
+            // If no bad news, we continue.
+            
+            // Check risk of "Bad Cascade"
+            let cascade_opt = self.latest_cascade.read().await;
+            if let Some(cascade) = cascade_opt.as_ref() {
+                 let against_us = match (signal.token_type, cascade.suggested_action) {
+                    (TokenType::Yes, CascadeAction::BuyDown) => true,
+                    (TokenType::No, CascadeAction::BuyUp) => true,
+                    _ => false
+                 };
+                 
+                 if against_us {
+                     warn!("⚠️ MOMENTUM SHIFT: Cascade against our position! Stopping cicil.");
+                     break; 
+                 }
+            }
+
+            // === CICIL LEG 2 (HEDGE) ===
+            // Fetch fresh market data to calculate Maker price
+            // We want to be a Maker (limit order) to earn rebates
+            // Target Price = Midpoint + Offset (0.02)
+            // But capped at 0.95 to avoid crossing spread too deep (Taker)
+            
+            let mut leg2_price = Decimal::new(95, 2); // Fallback Default
+            
+             // Use `fetch_orderbook` with the Leg 2 token ID we already resolved
+             match self.client.fetch_orderbook(&leg2_token_id).await {
+                Ok(book) => {
+                     // Get best bid/ask
+                     let best_bid = book.best_bid().unwrap_or(Decimal::ZERO);
+                     let best_ask = book.best_ask().unwrap_or(Decimal::new(99, 2));
+
+                     // Calculate Midpoint
+                     // If spread is wide, midpoint is safe maker.
+                     // Safe approach: (Bid + Ask) / 2
+                     let mid = (best_bid + best_ask) / Decimal::new(2, 0);
+                     let offset = self.config.trading.leg2_price_offset; // 0.02
+                     
+                     let raw_price = mid + offset;
+                     leg2_price = raw_price.min(Decimal::new(95, 2)); // Cap at 0.95
+                     
+                     info!("🎯 Leg 2 Pricing (Fresh): Bid=${:.3} Ask=${:.3} Mid=${:.3} -> Target=${:.3}", 
+                         best_bid, best_ask, mid, leg2_price);
+                }
+                Err(e) => {
+                    warn!("Failed to fetch orderbook for Leg 2 pricing: {}, using fallback 0.95", e);
+                    // Use fallback 0.95 or maybe inverse signal price?
+                    // Fallback to "safe" price
+                }
+             }
+
+            info!("📦 Cicil #{}: Placing Leg2 {} {} @ ${} (Maker Mode)",
+                cicil_num, leg2_type, this_cicil, leg2_price);
+
+            let leg2_order = OrderRequest {
+                token_id: leg2_token_id.clone(),
+                side: Side::Buy,
+                price: leg2_price,
+                size: this_cicil,
+                order_type: OrderType::GoodTilCancelled,
+                expiration: None,
+                neg_risk: false,
+            };
+
+            let placed_leg2 = if is_simulated {
+                info!("[SIM] Would place Leg2 order");
+                Order {
+                    id: format!("sim_leg2_{}", uuid::Uuid::new_v4()),
+                    status: PolyOrderStatus::Live,
+                    token_id: leg2_token_id.clone(),
+                    side: Side::Buy,
+                    original_size: this_cicil,
+                    size_matched: this_cicil,
+                    price: leg2_price,
+                    created_at: Utc::now(),
+                }
+            } else {
+                self.client.place_order(&leg2_order).await?
+            };
+            leg2_orders.push(placed_leg2.id.clone());
+            total_leg2_filled += this_cicil;
+
+            info!("✅ Cicil #{} complete: Leg1={}, Leg2={}",
+                cicil_num, total_leg1_filled, total_leg2_filled);
+
+            // Short delay between cicils
+            if cicil_num < max_cicil && total_leg1_filled < max_shares {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+
+        // Mark market as processed
+        self.processed_markets.write().await.insert(signal.market_id.clone());
+
+        // Create HedgeTrade record
+        let trade_id = uuid::Uuid::new_v4().to_string();
+        let trade = HedgeTrade {
+            id: trade_id.clone(),
+            market_id: signal.market_id.clone(),
+            asset: self.extract_asset(&signal.market_id),
+            leg1: TradeLeg {
+                order_id: leg1_orders.first().cloned(),
+                token_id: leg1_token_id,
+                token_type: signal.token_type,
+                side: Side::Buy,
+                price: signal.suggested_price,
+                size: total_leg1_filled,
+                filled_size: total_leg1_filled,
+                status: LegStatus::Filled,
+                filled_at: Some(Utc::now()),
+            },
+            leg2: Some(TradeLeg {
+                order_id: leg2_orders.first().cloned(),
+                token_id: leg2_token_id,
+                token_type: leg2_type,
+                side: Side::Buy,
+                price: signal.current_no + self.config.trading.leg2_price_offset,
+                size: total_leg2_filled,
+                filled_size: total_leg2_filled,
+                status: LegStatus::Filled,
+                filled_at: Some(Utc::now()),
+            }),
+            status: HedgeStatus::Complete,
+            entry_reason: format!("Cicil hedge: {} iterations, {} total shares",
+                leg1_orders.len(), total_leg1_filled),
+            created_at: Utc::now(),
+            timeout_at: Utc::now() + Duration::seconds(self.config.trading.max_legs_timeout_sec as i64),
+            closed_at: Some(Utc::now()),
+            pnl: None, // Will be calculated when fills confirmed
+            is_simulated,
+        };
+
+        self.active_trades.write().await.insert(trade_id.clone(), trade.clone());
+
+        info!("═══════════════════════════════════════════════════════════════");
+        info!("  ✅ CICIL HEDGE COMPLETE");
+        info!("  Total Leg1: {} shares | Total Leg2: {} shares", total_leg1_filled, total_leg2_filled);
+        info!("  Trade ID: {}", trade_id);
+        info!("═══════════════════════════════════════════════════════════════");
+
+        Ok(Some(trade))
+    }
+
+    // =========================================================================
+    // PARTIAL FILL HANDLER
+    // =========================================================================
+
+    /// Check for partial fill imbalances and auto-rebalance
+    /// Call this periodically (e.g., every 5-10 seconds) instead of on every market update
+    pub async fn check_and_rebalance_fills(&self) -> Result<()> {
+        if !self.config.fill_monitor.enable_auto_rebalance {
+            return Ok(());
+        }
+
+        let max_imbalance = self.config.fill_monitor.max_imbalance_shares;
+        let trades = self.active_trades.read().await;
+
+        for (trade_id, trade) in trades.iter() {
+            // Skip completed or timed out trades
+            if trade.status == HedgeStatus::Complete || trade.status == HedgeStatus::TimedOut {
+                continue;
+            }
+
+            // Get actual fill sizes from API
+            let leg1_filled = self.get_order_filled_size(&trade.leg1).await;
+            let leg2_filled = if let Some(ref leg2) = trade.leg2 {
+                self.get_order_filled_size(leg2).await
+            } else {
+                Decimal::ZERO
+            };
+
+            let imbalance = (leg1_filled - leg2_filled).abs();
+
+            if imbalance > max_imbalance {
+                warn!(
+                    "⚠️ IMBALANCE DETECTED: Trade {} | Leg1={} Leg2={} | Imbalance={}",
+                    trade_id, leg1_filled, leg2_filled, imbalance
+                );
+
+                // Determine which side to sell
+                if leg1_filled > leg2_filled {
+                    // We have more Leg1 (e.g., Yes) than Leg2 (No)
+                    // Need to sell excess Leg1 to rebalance
+                    let excess = leg1_filled - leg2_filled;
+                    info!(
+                        "🔄 AUTO-REBALANCE: Selling {} excess {} shares",
+                        excess, trade.leg1.token_type
+                    );
+
+                    if !trade.is_simulated {
+                        let sell_order = OrderRequest {
+                            token_id: trade.leg1.token_id.clone(),
+                            side: Side::Sell,
+                            price: Decimal::new(1, 2), // Aggressive sell at $0.01 to guarantee fill
+                            size: excess,
+                            order_type: OrderType::GoodTilCancelled,
+                            expiration: None,
+                            neg_risk: false,
+                        };
+
+                        match self.client.place_order(&sell_order).await {
+                            Ok(order) => {
+                                info!("✅ Rebalance sell placed: {} @ minimum price", order.id);
+                            }
+                            Err(e) => {
+                                error!("❌ Failed to place rebalance sell: {}", e);
+                            }
+                        }
+                    }
+                } else if leg2_filled > leg1_filled {
+                    // We have more Leg2 than Leg1 - sell excess Leg2
+                    let excess = leg2_filled - leg1_filled;
+                    if let Some(ref leg2) = trade.leg2 {
+                        info!(
+                            "🔄 AUTO-REBALANCE: Selling {} excess {} shares",
+                            excess, leg2.token_type
+                        );
+
+                        if !trade.is_simulated {
+                            let sell_order = OrderRequest {
+                                token_id: leg2.token_id.clone(),
+                                side: Side::Sell,
+                                price: Decimal::new(1, 2),
+                                size: excess,
+                                order_type: OrderType::GoodTilCancelled,
+                                expiration: None,
+                                neg_risk: false,
+                            };
+
+                            match self.client.place_order(&sell_order).await {
+                                Ok(order) => {
+                                    info!("✅ Rebalance sell placed: {} @ minimum price", order.id);
+                                }
+                                Err(e) => {
+                                    error!("❌ Failed to place rebalance sell: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get actual filled size for an order from API
+    async fn get_order_filled_size(&self, leg: &TradeLeg) -> Decimal {
+        if let Some(ref order_id) = leg.order_id {
+            // In simulation, return the leg size
+            if self.config.is_test_mode() {
+                return leg.size;
+            }
+
+            // Query fills from API
+            match self.client.get_fills(None).await {
+                Ok(fills) => {
+                    let filled: Decimal = fills
+                        .iter()
+                        .filter(|f| f.order_id == *order_id)
+                        .map(|f| f.size)
+                        .sum();
+                    filled
+                }
+                Err(e) => {
+                    warn!("Failed to get fills for order {}: {}", order_id, e);
+                    leg.filled_size // Return cached value
+                }
+            }
+        } else {
+            leg.filled_size
+        }
+    }
+
+    /// Dedicated fill monitor task - runs independently to reduce polling spam
+    /// Call this from main.rs as a spawned task
+    pub async fn run_fill_monitor(&self) {
+        let poll_interval = self.config.fill_monitor.poll_interval_sec;
+
+        info!("📊 Fill monitor started (interval: {}s)", poll_interval);
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(poll_interval as u64)).await;
+
+            // Check and rebalance
+            if let Err(e) = self.check_and_rebalance_fills().await {
+                error!("Fill monitor error: {}", e);
+            }
+
+            // Also update balance periodically
+            if let Err(e) = self.update_balance().await {
+                debug!("Balance update failed: {}", e);
+            }
+        }
     }
 }
 
