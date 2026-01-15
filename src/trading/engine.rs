@@ -657,14 +657,14 @@ impl TradingEngine {
             TokenType::No => (TokenType::Yes, signal.current_yes),
         };
 
-        // Aggressive Pricing Calculation (PSEUDO-MARKET ORDER)
-        // We increase slippage from 0.03 to 0.10 to survive massive volatility spikes.
-        // Even if we bid +0.10, the engine will still give us the BEST available price (e.g. +0.00).
-        // This is strictly a safety net to prevent "Unfilled Orders" during dumps/pumps.
-        let leg2_price = (base_leg2_price + Decimal::new(10, 2)).min(Decimal::new(99, 2));
+        // Aggressive Pricing Calculation (BALANCED)
+        // We reduce slippage from 0.10 to 0.05.
+        // +0.10 was too expensive (killing all profits).
+        // +0.05 is the sweet spot: safe enough for 95% markets, but keeps profit margins healthy.
+        let leg2_price = (base_leg2_price + Decimal::new(5, 2)).min(Decimal::new(99, 2));
 
         info!(
-            "Atomic Hedge: Adjusting Leg 2 Price from {} -> {} (Ultra-Aggressive +0.10)",
+            "Atomic Hedge: Adjusting Leg 2 Price from {} -> {} (Moderate Aggressive +0.05)",
             base_leg2_price, leg2_price
         );
 
