@@ -657,14 +657,13 @@ impl TradingEngine {
             TokenType::No => (TokenType::Yes, signal.current_yes),
         };
 
-        // Aggressive Pricing Calculation (BALANCED)
-        // We reduce slippage from 0.10 to 0.05.
-        // +0.10 was too expensive (killing all profits).
-        // +0.05 is the sweet spot: safe enough for 95% markets, but keeps profit margins healthy.
-        let leg2_price = (base_leg2_price + Decimal::new(5, 2)).min(Decimal::new(99, 2));
+        // Aggressive Pricing Calculation (PSEUDO-MARKET ORDER)
+        // Reverting to +0.10 after naked position incident with +0.05.
+        // Safety priority: GUARANTEE FILL over profit margin.
+        let leg2_price = (base_leg2_price + Decimal::new(10, 2)).min(Decimal::new(99, 2));
 
         info!(
-            "Atomic Hedge: Adjusting Leg 2 Price from {} -> {} (Moderate Aggressive +0.05)",
+            "Atomic Hedge: Adjusting Leg 2 Price from {} -> {} (Ultra-Aggressive +0.10)",
             base_leg2_price, leg2_price
         );
 

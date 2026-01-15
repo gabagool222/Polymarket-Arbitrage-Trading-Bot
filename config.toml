@@ -54,7 +54,7 @@ spot_move_trigger_pct = 0.5
 entry_window_min = 14
 
 # Max timeout for completing hedge (Leg 2) in seconds
-max_legs_timeout_sec = 420
+max_legs_timeout_sec = 60
 
 # Maximum daily risk as % of total capital
 max_daily_risk_pct = 20.0
