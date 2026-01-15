@@ -134,12 +134,12 @@ impl Default for TradingConfig {
                 "will-sol-go-up-15-min".to_string(),
             ],
             per_trade_shares: Decimal::new(20, 1), // 2.0
-            min_profit_threshold: Decimal::new(95, 2), // 0.95
+            min_profit_threshold: Decimal::new(92, 2), // 0.92 (Strict Spread)
             min_price_sum: Decimal::new(90, 2), // 0.90
             dump_trigger_pct: Decimal::new(15, 2), // 0.15
             spot_move_trigger_pct: Decimal::new(5, 1), // 0.5
             entry_window_min: 2,
-            max_legs_timeout_sec: 420,
+            max_legs_timeout_sec: 60,
             max_daily_risk_pct: Decimal::new(200, 1), // 20.0
             orderbook_depth: 5,
             slippage_bps: 50,
