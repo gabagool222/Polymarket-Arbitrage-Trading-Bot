@@ -11,7 +11,7 @@ Automated hedging and arbitrage bot for **Polymarket** 15-minute crypto binary m
 
 The bot trades **15-minute binary markets** on Polymarket (e.g. “Will BTC go up in the next 15 min?”). It uses two main ideas:
 
-1. **Hedging arbitrage** — When Yes + No prices add up to less than $1, you can buy both sides and lock in profit when the market settles.
+1. **Hedging arbitrage** — When Yes + No prices add up to less than $1, you can buy both sides and lock in profit when the market  settles.
 2. **Latency / signal arbitrage** — Uses Binance (and optionally Bybit) price moves to enter before Polymarket odds fully adjust.
 
 For a **beginner-friendly explanation** of how the strategies work and how to use the bot, see the **[docs](docs/)** folder.
