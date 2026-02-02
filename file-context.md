@@ -1,7 +1,7 @@
-# PolyRustArb-BOT: Project Context & Evolution Report
+# Polymarket Arbitrage Bot: Project Context & Evolution Report
 
 ## 1. Project Overview
-**PolyRustArb-BOT** is a high-performance arbitrage bot built in **Rust** (for execution speed) and **Python** (for EIP-712 signing), designed to trade 15-minute Binary Options markets (BTC, ETH, SOL) on Polymarket via the CLOB API.
+**Polymarket Arbitrage Bot** (pmarb) is a high-performance arbitrage bot built in **Rust** (for execution speed) and **Python** (for EIP-712 signing), designed to trade 15-minute Binary Options markets (BTC, ETH, SOL) on Polymarket via the CLOB API.
 
 **Current Strategy:** "Turbo Atomic Sniper"
 **Core Philosophy:** Maximum Safety (Capital Preservation) > High Frequency Profit.

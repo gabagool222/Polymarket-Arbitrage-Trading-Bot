@@ -1,10 +1,11 @@
 [package]
-name = "poly-rust-arb"
+name = "polymarket-arb-bot"
 version = "0.1.0"
 edition = "2021"
-authors = ["PolyRustArb Team"]
-description = "Automated hedging/arbitrage bot for Polymarket 15-min crypto markets"
+authors = ["gabagool222"]
+description = "Polymarket Arbitrage Bot — automated hedging and arbitrage for 15-min crypto binary markets"
 license = "MIT"
+repository = "https://github.com/gabagool222/Polymarket-Arbitrage-Trading-Bot"
 
 [dependencies]
 # Async runtime
@@ -64,7 +65,7 @@ base64 = "0.21"
 default = []
 
 [[bin]]
-name = "polyarb"
+name = "pmarb"
 path = "src/main.rs"
 
 [profile.release]

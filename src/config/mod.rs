@@ -1,4 +1,4 @@
-//! Configuration module for PolyRustArb bot
+//! Configuration module for Polymarket Arbitrage Bot
 //!
 //! Loads configuration from config.toml and environment variables.
 //! Environment variables override config file values with POLY_ prefix.

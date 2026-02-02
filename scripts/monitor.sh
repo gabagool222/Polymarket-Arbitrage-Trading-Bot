@@ -1,16 +1,16 @@
 #!/bin/bash
-# PolyRustArb Bot Monitor Script
+# Polymarket Arbitrage Bot — Monitor Script
 # Usage: ./scripts/monitor.sh
 
 set -e
 
 echo "╔═══════════════════════════════════════════════════════════╗"
-echo "║           PolyRustArb Bot - Monitor Dashboard             ║"
+echo "║     Polymarket Arbitrage Bot - Monitor Dashboard         ║"
 echo "╚═══════════════════════════════════════════════════════════╝"
 echo ""
 
 # Check if running
-if pgrep -x "polyarb" > /dev/null; then
+if pgrep -x "pmarb" > /dev/null; then
     echo "✅ Bot Status: RUNNING"
 else
     echo "❌ Bot Status: STOPPED"
@@ -48,5 +48,3 @@ else
 fi
 
 echo ""
-echo "=== Container Logs (if Docker) ==="
-docker logs polyarb-bot --tail 10 2>/dev/null || echo "Not running in Docker or container not found"

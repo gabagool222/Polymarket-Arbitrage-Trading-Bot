@@ -1,4 +1,4 @@
-//! PolyRustArb Bot - Automated hedging/arbitrage for Polymarket 15-min crypto markets
+//! Polymarket Arbitrage Bot — automated hedging and arbitrage for 15-min crypto binary markets
 //!
 //! # Overview
 //!
@@ -43,12 +43,12 @@ use crate::polymarket::{PolymarketClient, MarketPrices, Market};
 use crate::trading::TradingEngine;
 use crate::utils::{init_logging, PnlTracker, RebateTracker, SimulationEngine};
 
-/// PolyRustArb - Polymarket Arbitrage Bot
+/// Polymarket Arbitrage Bot
 #[derive(Parser, Debug)]
-#[command(name = "polyarb")]
-#[command(author = "PolyRustArb Team")]
+#[command(name = "pmarb")]
+#[command(author = "gabagool222")]
 #[command(version = "0.1.0")]
-#[command(about = "Automated hedging/arbitrage bot for Polymarket 15-min crypto markets")]
+#[command(about = "Polymarket Arbitrage Bot — hedging and arbitrage for 15-min crypto binary markets")]
 struct Args {
     /// Operating mode: test (simulation) or real (live trading)
     #[arg(short, long, env = "POLY_MODE", default_value = "test")]
@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
 
 fn print_banner(config: &AppConfig, args: &Args) {
     info!("╔═══════════════════════════════════════════════════════════╗");
-    info!("║           PolyRustArb - Polymarket Arbitrage Bot          ║");
+    info!("║           Polymarket Arbitrage Bot (pmarb)                ║");
     info!("╠═══════════════════════════════════════════════════════════╣");
     info!("║  Mode: {:10}                                        ║",
           config.general.mode.to_string().to_uppercase());

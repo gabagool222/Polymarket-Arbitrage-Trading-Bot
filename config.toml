@@ -1,4 +1,4 @@
-# PolyRustArb Bot Configuration
+# Polymarket Arbitrage Bot Configuration
 # All values can be overridden via environment variables with POLY_ prefix
 # Example: POLY_MODE=real overrides [general].mode
 
